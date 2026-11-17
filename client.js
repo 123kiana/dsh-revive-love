@@ -33,6 +33,9 @@ window.__ModuleLoader__.load({
      */
     const PREVIEW_ROUTE = '/dsh-session-slim/preview'
     const BUILD_ROUTE = '/dsh-session-slim/build'
+    /** Folder scan of exports the user already downloaded, and loading one of them. */
+    const SCAN_ROUTE = '/dsh-session-slim/scan'
+    const OPEN_ROUTE = '/dsh-session-slim/scan-open'
     /** The shipped import action's upload route (its `protocol.ts` UPLOAD_ROUTE). */
     const IMPORT_ROUTE = 'api/deepseek-chat-import/archive'
     /** Turns offered by default when a conversation is picked. */
@@ -52,6 +55,12 @@ window.__ModuleLoader__.load({
       'step.upload.hint': '拖拽 deepseek_data-*.zip 到这里，或选择文件。',
       'step.upload.choose': '选择文件…',
       'step.upload.parsing': '正在解析压缩包…',
+      'step.upload.recentTitle': '已下载的导出包',
+      'step.upload.recentHint': '扫描下载、桌面、文档三个文件夹里名字像 deepseek_data*.zip 的文件，只在本机读取，不上传。',
+      'step.upload.recentEmpty': '没找到已下载的导出包。先在 DeepSeek 官网导出，再回到这里点「重新扫描」。',
+      'step.upload.recentScanning': '扫描中…',
+      'step.upload.recentRescan': '重新扫描',
+      'step.upload.recentMeta': '{size} · {time}',
       'step.upload.privacy': '文件只在本机内存中解析，不会上传到任何外部服务。',
       'step.pick.title': '2. 选择要复活的对话',
       'step.pick.search': '按标题搜索',
@@ -101,6 +110,9 @@ window.__ModuleLoader__.load({
       'error.import-failed': '导入失败：{message}',
       'error.upload-failed': '上传或解析失败：{message}',
       'error.bad-request': '请求无效：{message}',
+      'error.expired-scan': '上次扫描已过期，请重新扫描。',
+      'error.unknown-file': '这个文件已不可用，请重新扫描。',
+      'error.scan-failed': '扫描失败：{message}',
       'error.unknown': '操作失败：{message}',
     }
 
@@ -119,6 +131,12 @@ window.__ModuleLoader__.load({
       'step.upload.choose': 'Choose file…',
       'step.upload.parsing': 'Reading the archive…',
       'step.upload.privacy': 'The file is parsed in memory on this machine; nothing is sent to an external service.',
+      'step.upload.recentTitle': 'Exports already downloaded',
+      'step.upload.recentHint': 'Looks for deepseek_data*.zip in Downloads, Desktop and Documents. Read locally only; nothing is uploaded.',
+      'step.upload.recentEmpty': 'No downloaded export found. Export it on the DeepSeek website, then press Rescan.',
+      'step.upload.recentScanning': 'Scanning…',
+      'step.upload.recentRescan': 'Rescan',
+      'step.upload.recentMeta': '{size} · {time}',
       'step.pick.title': '2. Choose the conversation to revive',
       'step.pick.search': 'Search by title',
       'step.pick.count': '{count} conversations, newest update first',
@@ -167,6 +185,9 @@ window.__ModuleLoader__.load({
       'error.import-failed': 'Import failed: {message}',
       'error.upload-failed': 'Upload or parsing failed: {message}',
       'error.bad-request': 'Invalid request: {message}',
+      'error.expired-scan': 'The last folder scan expired. Scan again.',
+      'error.unknown-file': 'That file is no longer available. Scan again.',
+      'error.scan-failed': 'The folder scan failed: {message}',
       'error.unknown': 'The action failed: {message}',
     }
 
@@ -251,6 +272,14 @@ window.__ModuleLoader__.load({
     }
 
     /** A number as a short human string (`12.3k`, `1.2M`). */
+    /** Human size for a file, used by the folder scan rows. */
+    function formatBytes(value) {
+      const bytes = Number(value) || 0
+      if (bytes >= 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(1) + ' MB'
+      if (bytes >= 1024) return Math.round(bytes / 1024) + ' KB'
+      return bytes + ' B'
+    }
+
     function formatTokens(value) {
       const number = typeof value === 'number' && Number.isFinite(value) ? value : 0
       if (number >= 1000000) return `${(number / 1000000).toFixed(1)}M`
@@ -441,6 +470,8 @@ window.__ModuleLoader__.load({
       const [workspaceId, setWorkspaceId] = useState(undefined)
       const [result, setResult] = useState(null)
       const [dragOver, setDragOver] = useState(false)
+      const [recent, setRecent] = useState([])
+      const [scanBusy, setScanBusy] = useState(false)
       const fileInput = useRef(null)
       const surface = useRef(null)
       const request = useRef(null)
@@ -558,6 +589,63 @@ window.__ModuleLoader__.load({
           setBusy('')
         }
       }, [])
+
+      /** Rescan the user's own folders for exports they already downloaded. */
+      const scanFolders = useCallback(async () => {
+        setScanBusy(true)
+        try {
+          const response = await fetch(routeUrl(SCAN_ROUTE), {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: '{}',
+          })
+          const payload = await response.json()
+          if (payload !== null && typeof payload === 'object' && payload.ok === true && Array.isArray(payload.candidates)) {
+            setRecent(payload.candidates)
+          }
+          else {
+            setRecent([])
+          }
+        }
+        catch {
+          setRecent([])
+        }
+        finally {
+          setScanBusy(false)
+        }
+      }, [])
+
+      /** Load one archive the scan found, skipping the file picker. */
+      const openRecent = useCallback(async (candidate) => {
+        setBusy('upload')
+        setError(null)
+        try {
+          const response = await fetch(routeUrl(OPEN_ROUTE), {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ id: candidate.id }),
+          })
+          const payload = await response.json()
+          if (payload === null || typeof payload !== 'object' || payload.ok !== true) {
+            setError(errorFromPayload(payload))
+            return
+          }
+          setArchive(payload)
+          setSelectedId(null)
+          setQuery('')
+          setStep('pick')
+        }
+        catch (thrown) {
+          setError({ key: 'error.upload-failed', params: { message: messageOf(thrown) } })
+        }
+        finally {
+          setBusy('')
+        }
+      }, [])
+
+      useEffect(() => {
+        scanFolders()
+      }, [scanFolders])
 
       const generate = useCallback(async () => {
         if (selected === undefined || archive === null) return
@@ -694,6 +782,37 @@ window.__ModuleLoader__.load({
             }),
           ),
           h('p', { className: 'dsh-slim-note' }, t('step.upload.privacy')),
+          h('div', { className: 'dsh-slim-field' },
+            h('div', { className: 'dsh-slim-keeprow' },
+              h('h3', { className: 'dsh-slim-section' }, t('step.upload.recentTitle')),
+              h('button', {
+                type: 'button',
+                className: 'dsh-slim-button',
+                disabled: running || scanBusy,
+                onClick: () => { void scanFolders() },
+              }, scanBusy ? t('step.upload.recentScanning') : t('step.upload.recentRescan')),
+            ),
+            h('p', { className: 'dsh-slim-note' }, t('step.upload.recentHint')),
+            recent.length === 0
+              ? h('p', { className: 'dsh-slim-note' }, t('step.upload.recentEmpty'))
+              : h('div', { className: 'dsh-slim-list' }, recent.map(candidate => h('button', {
+                key: candidate.id,
+                type: 'button',
+                className: 'dsh-slim-row',
+                disabled: running,
+                onClick: () => { void openRecent(candidate) },
+              },
+                h('span', { className: 'dsh-slim-rowhead' },
+                  h('span', { className: 'dsh-slim-rowtitle', title: candidate.name }, candidate.name),
+                ),
+                h('span', { className: 'dsh-slim-meta' },
+                  h(Meta, null, t('step.upload.recentMeta', {
+                    size: formatBytes(candidate.size),
+                    time: formatTime(candidate.modifiedAt),
+                  })),
+                ),
+              ))),
+          ),
           errorLine,
           busy === 'upload' ? h('p', { className: 'dsh-slim-note', role: 'status' }, t('step.upload.parsing')) : null,
         )
