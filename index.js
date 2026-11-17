@@ -28,8 +28,10 @@
  * dependencies.
  */
 
-import { randomUUID } from 'node:crypto'
-import { readFileSync } from 'node:fs'
+import { createHash, randomUUID } from 'node:crypto'
+import { readFileSync, readdirSync, statSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { basename, join, resolve } from 'node:path'
 import { inflateRawSync } from 'node:zlib'
 
 /** The plugin's own identity, echoed by the patch row and the client bundle. */
@@ -49,6 +51,17 @@ export const version = (() => {
 /** Exact routes; the browser bundle resolves the same strings against `document.baseURI`. */
 export const PREVIEW_ROUTE = '/dsh-session-slim/preview'
 export const BUILD_ROUTE = '/dsh-session-slim/build'
+/** Lists export archives already sitting in the user's own folders (no network, no scraping). */
+export const SCAN_ROUTE = '/dsh-session-slim/scan'
+/** Loads one archive found by the scan, so the wizard skips the file picker. */
+export const OPEN_ROUTE = '/dsh-session-slim/scan-open'
+
+/** Filename shape of a DeepSeek website export. */
+const SCAN_PATTERN = /^deepseek_data.*\.zip$/i
+/** Most scanned archives offered at once. */
+const MAX_CANDIDATES = 10
+/** How long a scan result stays loadable. */
+const SCAN_TTL_MS = 10 * 60 * 1000
 
 /** The only export format version the shipped importer reads. */
 export const SUPPORTED_EXPORT_FORMAT_VERSION = 3
@@ -974,8 +987,192 @@ export function buildHandler(ctx) {
   }
 }
 
+// ── scans of the user's own folders ────────────────────────────────────────
+
+/** Folders searched for exports the user already downloaded. */
+function scanRoots() {
+  const home = homedir()
+  return [
+    join(home, 'Downloads'),
+    join(home, 'Desktop'),
+    join(home, 'Documents'),
+  ]
+}
+
+/** Cached scan: ids resolve to absolute paths, and expire with the upload window. */
+let scanCache = { at: 0, byId: new Map() }
+
+/** Drop the cached scan. */
+function clearScan() {
+  scanCache = { at: 0, byId: new Map() }
+}
+
 /**
- * Register the two routes on the harness web server, which may be acquired later.
+ * List DeepSeek export archives already present in the user's own folders.
+ * Nothing leaves the machine: this only stats filenames that match the export shape.
+ * @returns candidate descriptors, newest modification first.
+ */
+export function scanExportFiles() {
+  const byId = new Map()
+  const candidates = []
+  for (const root of scanRoots()) {
+    let entries
+    try {
+      entries = readdirSync(root, { withFileTypes: true })
+    }
+    catch {
+      continue
+    }
+    for (const entry of entries) {
+      if (!entry.isFile() || !SCAN_PATTERN.test(entry.name)) continue
+      const full = resolve(root, entry.name)
+      let stat
+      try {
+        stat = statSync(full)
+      }
+      catch {
+        continue
+      }
+      const id = createHash('sha1').update(full).digest('hex').slice(0, 16)
+      byId.set(id, full)
+      candidates.push({ id, name: entry.name, size: stat.size, modifiedAt: new Date(stat.mtimeMs).toISOString() })
+    }
+  }
+  candidates.sort((left, right) => (left.modifiedAt < right.modifiedAt ? 1 : -1))
+  scanCache = { at: Date.now(), byId }
+  return candidates.slice(0, MAX_CANDIDATES)
+}
+
+/**
+ * Route handler: `POST /dsh-session-slim/scan`.
+ * @param ctx - Host context.
+ * @returns the Node request handler.
+ */
+export function scanHandler(ctx) {
+  return async (request, response) => {
+    if (request.method !== 'POST') {
+      response.writeHead(405, { allow: 'POST' })
+      response.end()
+      return
+    }
+    if (!sameOrigin(request)) {
+      sendJson(response, 403, { ok: false, code: 'origin' })
+      return
+    }
+    try {
+      sendJson(response, 200, { ok: true, candidates: scanExportFiles() })
+    }
+    catch (error) {
+      warn(ctx, 'scan failed', error)
+      sendJson(response, 200, { ok: false, code: 'scan-failed', error: String(error?.message ?? error) })
+    }
+  }
+}
+
+/**
+ * Route handler: `POST /dsh-session-slim/scan-open`.
+ * @param ctx - Host context.
+ * @returns the Node request handler.
+ */
+export function openHandler(ctx) {
+  return async (request, response) => {
+    if (request.method !== 'POST') {
+      response.writeHead(405, { allow: 'POST' })
+      response.end()
+      return
+    }
+    if (!sameOrigin(request)) {
+      sendJson(response, 403, { ok: false, code: 'origin' })
+      return
+    }
+    let body
+    try {
+      body = await readBoundedBody(request, MAX_JSON_BYTES)
+    }
+    catch (error) {
+      sendJson(response, 400, { ok: false, code: 'bad-request', error: String(error?.message ?? error) })
+      return
+    }
+    let id
+    try {
+      id = JSON.parse(body.toString('utf8')).id
+    }
+    catch {
+      sendJson(response, 400, { ok: false, code: 'bad-request', error: 'the request is not valid JSON' })
+      return
+    }
+    if (typeof id !== 'string' || id === '') {
+      sendJson(response, 400, { ok: false, code: 'bad-request', error: 'id must be a non-empty string' })
+      return
+    }
+    if (scanCache.at === 0 || Date.now() - scanCache.at > SCAN_TTL_MS) {
+      sendJson(response, 409, { ok: false, code: 'expired-scan', error: 'the folder scan expired; scan again' })
+      return
+    }
+    const full = scanCache.byId.get(id)
+    if (full === undefined) {
+      sendJson(response, 404, { ok: false, code: 'unknown-file', error: 'that file is not part of the last scan' })
+      return
+    }
+    // Re-validate: the path must still be directly inside one of the scanned roots,
+    // so a tampered id can never reach outside them.
+    const name = basename(full)
+    const inside = scanRoots().some((root) => full === resolve(root, name))
+    if (!inside || !SCAN_PATTERN.test(name)) {
+      sendJson(response, 400, { ok: false, code: 'bad-request', error: 'the file is outside the scanned folders' })
+      return
+    }
+    let buffer
+    let size
+    try {
+      const stat = statSync(full)
+      if (stat.size > MAX_ARCHIVE_BYTES) {
+        sendJson(response, 413, { ok: false, code: 'too-large', error: `the archive exceeds ${MAX_ARCHIVE_BYTES} bytes` })
+        return
+      }
+      size = stat.size
+      buffer = readFileSync(full)
+    }
+    catch (error) {
+      sendJson(response, 404, { ok: false, code: 'unknown-file', error: String(error?.message ?? error) })
+      return
+    }
+    let summary
+    try {
+      summary = summarizeArchive(buffer)
+    }
+    catch (error) {
+      if (error instanceof SlimError) {
+        sendJson(response, 200, { ok: false, code: error.code, error: error.message })
+        return
+      }
+      warn(ctx, 'scan-open failed', error)
+      sendJson(response, 200, { ok: false, code: 'unreadable-archive', error: String(error?.message ?? error) })
+      return
+    }
+    clearPending()
+    const uploadId = randomUUID()
+    pendingUpload = { id: uploadId, at: Date.now(), buffer, entries: summary.entries }
+    sendJson(response, 200, {
+      ok: true,
+      version,
+      uploadId,
+      from: { name, size },
+      total: summary.total,
+      omitted: Math.max(0, summary.total - summary.conversations.length),
+      limits: {
+        contextWindowTokens: CONTEXT_WINDOW_TOKENS,
+        historyBudgetTokens: HISTORY_BUDGET_TOKENS,
+        recommendTurns: RECOMMEND_TURNS,
+        maxKeepTurns: MAX_KEEP_TURNS,
+      },
+      conversations: summary.conversations,
+    })
+  }
+}
+
+/**
+ * Register the routes on the harness web server, which may be acquired later.
  * @param ctx - Host context.
  */
 export function apply(ctx) {
@@ -984,9 +1181,12 @@ export function apply(ctx) {
       const disposers = [
         host.webServer.register({ kind: 'exact', path: PREVIEW_ROUTE, handler: previewHandler(ctx) }),
         host.webServer.register({ kind: 'exact', path: BUILD_ROUTE, handler: buildHandler(ctx) }),
+        host.webServer.register({ kind: 'exact', path: SCAN_ROUTE, handler: scanHandler(ctx) }),
+        host.webServer.register({ kind: 'exact', path: OPEN_ROUTE, handler: openHandler(ctx) }),
       ]
       return () => {
         clearPending()
+        clearScan()
         for (const dispose of disposers) dispose()
       }
     }, 'session-slim: http routes')
