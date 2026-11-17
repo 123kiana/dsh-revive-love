@@ -40,7 +40,9 @@ git clone https://github.com/123kiana/dsh-revive-love.git
 
 侧边栏「新建会话」右侧多出一颗心电图按钮，点开是三步向导：
 
-1. **上传**：选择从 DeepSeek 官网导出的 `deepseek_data-*.zip`（`export_format_version: 3`）
+1. **上传**：选择从 DeepSeek 官网导出的 `deepseek_data-*.zip`（`export_format_version: 3`）。
+   如果导出包已经在你的**下载 / 桌面 / 文档**文件夹里，向导会自动把它们列出来，点一下就能加载，
+   不用再手动选文件（纯本地扫描，不上传、不联网）
 2. **选择对话**：列出压缩包里所有对话，按最后更新时间倒序，可按标题搜索。
    超过 500 轮的带「推荐处理」角标
 3. **设定保留轮数**：滑块或数字框，上限 500 轮；可以填一句「补充说明」，它会成为新会话的第一条消息
@@ -71,7 +73,10 @@ git clone https://github.com/123kiana/dsh-revive-love.git
 ## 隐私
 
 导出的压缩包只在**本机内存**里解析，不落盘、不联网、不收集任何数据；
-结果只 POST 给本机 DSH 的官方导入路由。详见 [SECURITY.md](SECURITY.md)。
+结果只 POST 给本机 DSH 的官方导入路由。
+
+「已下载的导出包」扫描只读取下载 / 桌面 / 文档三个文件夹里匹配 `deepseek_data*.zip` 的文件名与修改时间，
+不读取内容、不离开本机；加载时才读文件内容，并再次校验路径确实在这三个目录下。详见 [SECURITY.md](SECURITY.md)。
 
 ## 许可
 
