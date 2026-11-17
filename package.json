@@ -1,0 +1,62 @@
+{
+  "name": "dsh-revive-love",
+  "version": "1.0.0",
+  "description": "Unofficial third-party DSH plugin: revive an over-long DeepSeek chat export by importing only its most recent turns.",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "docs",
+    "icon.svg",
+    "README.md",
+    "LICENSE",
+    "SECURITY.md",
+    "CHANGELOG.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-api-session-controller",
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-renderer",
+        "@deepseek-ai/dsh-client-ui-sidebar"
+      ]
+    }
+  },
+  "license": "MIT",
+  "keywords": [
+    "deepseek",
+    "harness",
+    "dsh",
+    "dsh-plugin",
+    "session",
+    "context",
+    "import",
+    "revive"
+  ],
+  "author": "123kiana",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/123kiana/dsh-revive-love"
+  },
+  "homepage": "https://github.com/123kiana/dsh-revive-love#readme",
+  "bugs": {
+    "url": "https://github.com/123kiana/dsh-revive-love/issues"
+  }
+}
