@@ -1,0 +1,4 @@
+# dsh bundle patch: inserts the session-slim plugin into the profile's layer stack.
+- insert:
+    - id: session-slim
+      name: 'dsh-revive-love'
