@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.1.1
+
+- 修正发布用的 `package.json`：移除误带的 `"private": true`，并从 `files` 里删掉内部笔记 `NOTES.md` 的引用
+- 功能与 1.1.0 相同，只是打包清单干净了
+
 ## 1.1.0
 
 - 第一步新增「已下载的导出包」：扫描下载 / 桌面 / 文档三个文件夹里的 `deepseek_data*.zip`，
