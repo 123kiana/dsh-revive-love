@@ -9,17 +9,24 @@ DSH 的上下文窗口是 1048576 token，通常还要为输出预留约 25 万�
 
 ## 安装
 
-### 从 Release 下载（推荐）
+### 从 npm 安装（推荐）
 
-1. 到 [Releases](../../releases) 下载最新的 `dsh-revive-love-<version>.zip`
+```bash
+pnpm add dsh-revive-love
+```
+
+或者在 DSH 插件页的 **Add plugin** 里直接填包名 `dsh-revive-love`。
+
+装完**完全退出 DSH 再打开**（客户端模块在启动时加载，只刷新页面不够）。
+
+### 从 GitHub Release 安装（不装包管理器时用这个）
+
+1. 到 [Releases](../../releases/latest) 下载最新的 `dsh-revive-love-<version>-release.zip`
 2. 解压得到 `dsh-revive-love` 目录
 3. DSH → 插件页 → **Add plugin** → 选择这个目录
-4. 完全退出 DSH 再打开（客户端模块在启动时加载，只刷新页面不够）
+4. 完全退出 DSH 再打开
 
-**装之前先确认：** 官方「DeepSeek 会话导入」插件（`@deepseek-ai/dsh-deepseek-chat-import`）已启用。
-本插件复用它把结果落盘；它不在时会退化成"下载 zip"，需要你手工导入。
-
-### 从源码目录安装（给要改代码的人）
+### 从源码安装（给要改代码的人）
 
 ```bash
 git clone https://github.com/123kiana/dsh-revive-love.git
@@ -27,7 +34,13 @@ git clone https://github.com/123kiana/dsh-revive-love.git
 
 然后在 DSH 插件页 **Add plugin** 里选克隆下来的目录。
 
-> 从 git 地址直接安装依赖本机存在 `git` 命令；没有 `git` 时请用上面的 zip 方式。
+> 上面两种手动方式安装的都是本地目录依赖（`link:`），目录一挪动插件就失效。
+> 想以后能用 `pnpm update` 升级，请走 npm 那条。
+
+### 装之前先确认
+
+官方「DeepSeek 会话导入」插件（`@deepseek-ai/dsh-deepseek-chat-import`）已启用。
+本插件复用它把结果落盘；它不在时会退化成"下载 zip"，需要你手工导入。
 
 ## 依赖
 
