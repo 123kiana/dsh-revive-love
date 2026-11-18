@@ -1,7 +1,14 @@
-﻿node_modules/
+node_modules/
+_dist/
 *.log
 *.tgz
 *.zip
 .DS_Store
 Thumbs.db
 NOTES.md
+.dsh-slim/
+.npmrc
+.env
+.env.*
+.vscode/
+.idea/

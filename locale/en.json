@@ -1,7 +1,7 @@
 {
   "meta": {
     "title": "Revive My Love",
-    "description": "Upload a ZIP exported from the DeepSeek website, rescue a conversation that is about to overflow its context, and import it again with only its most recent turns so you can keep talking. Three steps: upload, pick a conversation, choose how many turns to keep.",
+    "description": "Unofficial third-party plugin. Upload a ZIP exported from the DeepSeek website, rescue a conversation that is about to overflow its context, and import it again with only its most recent turns (10 by default) so you can keep talking. Three steps: upload, pick a conversation, choose how many turns to keep.",
     "detail": "docs/DETAIL.md"
   }
 }

@@ -36,10 +36,22 @@ window.__ModuleLoader__.load({
     /** Folder scan of exports the user already downloaded, and loading one of them. */
     const SCAN_ROUTE = '/dsh-session-slim/scan'
     const OPEN_ROUTE = '/dsh-session-slim/scan-open'
+    /** Amplify mode: plan, run, poll, cancel. */
+    const AMPLIFY_PLAN_ROUTE = '/dsh-session-slim/amplify/plan'
+    const AMPLIFY_START_ROUTE = '/dsh-session-slim/amplify/start'
+    const AMPLIFY_STATUS_ROUTE = '/dsh-session-slim/amplify/status'
+    const AMPLIFY_CANCEL_ROUTE = '/dsh-session-slim/amplify/cancel'
+    const AMPLIFY_DECIDE_ROUTE = '/dsh-session-slim/amplify/decide'
     /** The shipped import action's upload route (its `protocol.ts` UPLOAD_ROUTE). */
     const IMPORT_ROUTE = 'api/deepseek-chat-import/archive'
     /** Turns offered by default when a conversation is picked. */
     const DEFAULT_KEEP = 10
+    /**
+     * Longest the browser keeps polling one run. The Host gives up at 10 minutes, and a
+     * parked run waits at most 15 more for an answer, so this is comfortably above both:
+     * it only exists to stop polling a run that can no longer settle.
+     */
+    const AMPLIFY_POLL_MAX_MS = 30 * 60 * 1000
 
     /** Simplified Chinese dictionary (the key-set source of truth). */
     const ZH = {
@@ -71,7 +83,6 @@ window.__ModuleLoader__.load({
       'step.pick.turns': '{count} 轮',
       'step.pick.tokens': '约 {tokens} token',
       'step.pick.updated': '更新于 {time}',
-      'step.pick.select': '选择',
       'step.config.title': '3. 设定保留范围',
       'step.config.keep': '保留最近多少轮',
       'step.config.keepHint': '可保留 1–{max} 轮',
@@ -84,7 +95,31 @@ window.__ModuleLoader__.load({
       'step.config.workspace': '导入到工作区',
       'step.config.workspaceNone': '没有可用的工作区',
       'step.config.generate': '生成',
-      'dialog.uploading': '正在上传…',
+      'step.config.amplify': '增幅模式：先总结被移除的内容',
+      'step.config.waitAmplify': '等总结结束…',
+      'step.config.amplifyHint': '开启后会把被移除的 {count} 轮压成摘要，作为新会话的第一条消息。',
+      'amplify.title': '开启增幅模式',
+      'amplify.lead': '被移除的 {count} 轮原文会发送给模型，用来生成摘要。',
+      'amplify.workspace': '会在「{name}」新建 1 条总结会话，保留不自动删除',
+      'amplify.model': '模型：flash、思考关闭',
+      'amplify.segments': '会写成 {count} 个文件，交给一条总结会话读完并压缩',
+      'amplify.tokens': '预计可能超过 {tokens} token',
+      'amplify.cache': '摘要任务基本没有缓存可用，缓存命中率低，实际花费相较于日常使用更高',
+      'amplify.failure': '需要等待，期间可能失败或超时；失败时可以选择不带摘要继续',
+      'amplify.confirm': '我已了解，开启',
+      'amplify.planning': '正在计算分段…',
+      'amplify.progress': '总结会话正在处理 {count} 个分片…',
+      'amplify.cancel': '取消（摘要作废）',
+      'amplify.done': '摘要已生成，生成复活会话时会自动带上。',
+      'amplify.cancelled': '已取消，摘要作废；生成时会不带摘要继续。',
+      'amplify.failed': '摘要失败，生成时会不带摘要继续。',
+      'amplify.stalledTime': '已经等了很久还没结果，可能失败了。',
+      'amplify.keepWaiting': '继续等',
+      'amplify.stopHere': '取消（摘要作废）',
+      'amplify.without': '不带摘要继续',
+      'amplify.miniTitle': '增幅模式运行中',
+      'amplify.expand': '展开',
+      'amplify.minimize': '最小化',
       'dialog.building': '正在重建压缩包…',
       'dialog.importing': '正在导入…',
       'result.title': '复活完成',
@@ -92,7 +127,6 @@ window.__ModuleLoader__.load({
       'result.turns': '保留 {kept} 轮（丢弃 {removed} 轮）',
       'result.tokens': '估算约 {tokens} token',
       'result.imported': '已直接导入到工作区，共 {count} 个新会话。',
-      'result.importedOne': '已直接导入到工作区，新会话：{id}',
       'result.downloaded': '已下载 {name}。请用侧边栏的「导入 DeepSeek 会话」按钮导入它。',
       'result.downloadedNoPlugin': '已下载 {name}，但没有找到官方导入插件；请先安装「导入 DeepSeek 会话」再导入这个文件。',
       'result.done': '完成',
@@ -113,6 +147,9 @@ window.__ModuleLoader__.load({
       'error.expired-scan': '上次扫描已过期，请重新扫描。',
       'error.unknown-file': '这个文件已不可用，请重新扫描。',
       'error.scan-failed': '扫描失败：{message}',
+      'error.origin': '这个请求的来源不被允许，已拒绝。',
+      'error.amplify-busy': '已经有一个增幅任务在跑，等它结束或先取消它。',
+      'error.nothing-to-summarize': '没有会被丢弃的轮次，不需要做摘要。',
       'error.unknown': '操作失败：{message}',
     }
 
@@ -146,7 +183,6 @@ window.__ModuleLoader__.load({
       'step.pick.turns': '{count} turns',
       'step.pick.tokens': 'about {tokens} tokens',
       'step.pick.updated': 'updated {time}',
-      'step.pick.select': 'Choose',
       'step.config.title': '3. Choose what to keep',
       'step.config.keep': 'Keep the most recent turns',
       'step.config.keepHint': '1–{max} turns can be kept',
@@ -159,7 +195,31 @@ window.__ModuleLoader__.load({
       'step.config.workspace': 'Import into workspace',
       'step.config.workspaceNone': 'No workspace is available',
       'step.config.generate': 'Generate',
-      'dialog.uploading': 'Uploading…',
+      'step.config.amplify': 'Amplify mode: summarize what gets dropped',
+      'step.config.waitAmplify': 'Waiting for the summary…',
+      'step.config.amplifyHint': 'Condenses the {count} dropped turns into a summary and puts it at the top of the revived conversation.',
+      'amplify.title': 'Turn on amplify mode',
+      'amplify.lead': 'The {count} dropped turns are sent to a model to produce a summary.',
+      'amplify.workspace': 'Creates 1 summary conversation in "{name}" and keeps it',
+      'amplify.model': 'Model: flash, reasoning off',
+      'amplify.segments': 'Writes {count} file(s) for one summary session to read and condense',
+      'amplify.tokens': 'Expected to exceed {tokens} tokens',
+      'amplify.cache': 'Summary work has essentially no cache reuse, so it costs more than everyday chatting',
+      'amplify.failure': 'It takes a while and may fail or stall; if it does you can continue without the summary',
+      'amplify.confirm': 'I understand, turn it on',
+      'amplify.planning': 'Working out the segments…',
+      'amplify.progress': 'The summary session is working through {count} chunk(s)…',
+      'amplify.cancel': 'Cancel (discard the summary)',
+      'amplify.done': 'Summary ready; it will be attached when the revived conversation is built.',
+      'amplify.cancelled': 'Cancelled, summary discarded; the build continues without it.',
+      'amplify.failed': 'Summarizing failed; the build continues without a summary.',
+      'amplify.stalledTime': 'This is taking much longer than expected and may have failed.',
+      'amplify.keepWaiting': 'Keep waiting',
+      'amplify.stopHere': 'Cancel (discard the summary)',
+      'amplify.without': 'Continue without the summary',
+      'amplify.miniTitle': 'Amplify mode running',
+      'amplify.expand': 'Expand',
+      'amplify.minimize': 'Minimize',
       'dialog.building': 'Rebuilding the archive…',
       'dialog.importing': 'Importing…',
       'result.title': 'Revived',
@@ -167,7 +227,6 @@ window.__ModuleLoader__.load({
       'result.turns': 'Kept {kept} turns (dropped {removed})',
       'result.tokens': 'about {tokens} tokens',
       'result.imported': 'Imported directly into the workspace: {count} new sessions.',
-      'result.importedOne': 'Imported directly into the workspace: session {id}',
       'result.downloaded': 'Downloaded {name}. Import it with the sidebar’s “Import DeepSeek chats” action.',
       'result.downloadedNoPlugin': 'Downloaded {name}, but the official import plugin is not installed; install “Import DeepSeek chats” first.',
       'result.done': 'Done',
@@ -188,6 +247,9 @@ window.__ModuleLoader__.load({
       'error.expired-scan': 'The last folder scan expired. Scan again.',
       'error.unknown-file': 'That file is no longer available. Scan again.',
       'error.scan-failed': 'The folder scan failed: {message}',
+      'error.origin': 'That request came from a disallowed origin and was refused.',
+      'error.amplify-busy': 'An amplify run is already going. Wait for it or cancel it first.',
+      'error.nothing-to-summarize': 'No turn would be dropped, so there is nothing to summarize.',
       'error.unknown': 'The action failed: {message}',
     }
 
@@ -271,7 +333,14 @@ window.__ModuleLoader__.load({
       return Number.isFinite(time) ? new Date(time).toLocaleString() : ''
     }
 
-    /** A number as a short human string (`12.3k`, `1.2M`). */
+    /** Elapsed seconds as `mm:ss`. */
+    function formatElapsed(seconds) {
+      const total = Math.max(0, Math.round(Number(seconds) || 0))
+      const minutes = Math.floor(total / 60)
+      const rest = total % 60
+      return `${String(minutes).padStart(2, '0')}:${String(rest).padStart(2, '0')}`
+    }
+
     /** Human size for a file, used by the folder scan rows. */
     function formatBytes(value) {
       const bytes = Number(value) || 0
@@ -280,6 +349,7 @@ window.__ModuleLoader__.load({
       return bytes + ' B'
     }
 
+    /** A number as a short human string (`12.3k`, `1.2M`). */
     function formatTokens(value) {
       const number = typeof value === 'number' && Number.isFinite(value) ? value : 0
       if (number >= 1000000) return `${(number / 1000000).toFixed(1)}M`
@@ -472,6 +542,25 @@ window.__ModuleLoader__.load({
       const [dragOver, setDragOver] = useState(false)
       const [recent, setRecent] = useState([])
       const [scanBusy, setScanBusy] = useState(false)
+      /** Amplify mode: the switch, its confirmation, the plan, and live progress. */
+      const [amplifyOn, setAmplifyOn] = useState(false)
+      const [amplifyPlan, setAmplifyPlan] = useState(null)
+      const [amplifyDialog, setAmplifyDialog] = useState(false)
+      const [amplifyPhase, setAmplifyPhase] = useState('idle')
+      const [amplifyProgress, setAmplifyProgress] = useState({ count: 0 })
+      const [amplifySummary, setAmplifySummary] = useState(null)
+      const [amplifyError, setAmplifyError] = useState(null)
+      const [amplifyStall, setAmplifyStall] = useState(null)
+      /** Minimized while running, so the rest of DSH stays usable. */
+      const [amplifyMin, setAmplifyMin] = useState(false)
+      const [, setAmplifyTick] = useState(0)
+      /** When the run started, for the floating timer; the host also reports elapsedMs. */
+      const [amplifyStartedAt, setAmplifyStartedAt] = useState(0)
+      /** Tokens the host reports for this run, shown on the floating panel. */
+      const [amplifyTokens, setAmplifyTokens] = useState(0)
+      /** Floating panel position; null keeps it centred until the user drags it. */
+      const [floatPos, setFloatPos] = useState(null)
+      const floatDrag = useRef(null)
       const fileInput = useRef(null)
       const surface = useRef(null)
       const request = useRef(null)
@@ -545,16 +634,28 @@ window.__ModuleLoader__.load({
         setNote(dropped > 0 ? t('note.default', { removed: String(dropped) }) : '')
       }, [selectedId, dropped, noteTouched, t])
 
+      /**
+       * Leaving mid-run must not destroy the panel: closing minimises to the floating window,
+       * and that window goes away only when the user cancels the run on purpose.
+       */
+      const requestClose = useCallback(() => {
+        if (amplifyPhase === 'running' || amplifyPhase === 'stalled') {
+          setAmplifyMin(true)
+          return
+        }
+        onClose()
+      }, [amplifyPhase, onClose])
+
       useEffect(() => {
         const onKeyDown = (event) => {
           if (event.key === 'Escape') {
             event.stopPropagation()
-            onClose()
+            requestClose()
           }
         }
         document.addEventListener('keydown', onKeyDown, true)
         return () => { document.removeEventListener('keydown', onKeyDown, true) }
-      }, [onClose])
+      }, [requestClose])
 
       const upload = useCallback(async (file) => {
         setBusy('upload')
@@ -647,6 +748,219 @@ window.__ModuleLoader__.load({
         scanFolders()
       }, [scanFolders])
 
+      // While a run is live the floating panel shows a clock, so re-render every second.
+      useEffect(() => {
+        if (amplifyPhase !== 'running' && amplifyPhase !== 'stalled') return undefined
+        const timer = setInterval(() => { setAmplifyTick((value) => value + 1) }, 1000)
+        return () => { clearInterval(timer) }
+      }, [amplifyPhase])
+
+      // A stalled run needs a decision, so bring the full dialog back on its own.
+      useEffect(() => {
+        if (amplifyPhase === 'stalled') setAmplifyMin(false)
+      }, [amplifyPhase])
+
+      /** Ask the Host how the discarded turns would be split, then show the warning. */
+      const openAmplify = useCallback(async () => {
+        if (selected === undefined || archive === null) return
+        setAmplifyError(null)
+        setAmplifyPhase('planning')
+        try {
+          const response = await fetch(routeUrl(AMPLIFY_PLAN_ROUTE), {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ conversationId: selected.id, keepTurns: keep }),
+          })
+          const payload = await response.json()
+          if (payload === null || typeof payload !== 'object' || payload.ok !== true) {
+            setAmplifyOn(false)
+            setAmplifyPhase('idle')
+            setAmplifyError(errorFromPayload(payload))
+            return
+          }
+          setAmplifyPlan(payload)
+          setAmplifyPhase('idle')
+          setAmplifyDialog(true)
+        }
+        catch (thrown) {
+          setAmplifyOn(false)
+          setAmplifyPhase('idle')
+          setAmplifyError({ key: 'error.scan-failed', params: { message: messageOf(thrown) } })
+        }
+      }, [archive, keep, selected])
+
+      /**
+       * Poll the Host until the run settles. Shared by a fresh start and by a wizard that
+       * was closed and reopened while a run was still going, so the panel always comes back.
+       */
+      const pollAmplify = useCallback(async () => {
+        const pollStartedAt = Date.now()
+        for (;;) {
+          await new Promise((resolve) => setTimeout(resolve, 2000))
+          // Only a real unmount aborts the stored request; minimising keeps it alive.
+          if (request.current !== null && request.current.signal.aborted) return
+          if (Date.now() - pollStartedAt > AMPLIFY_POLL_MAX_MS) {
+            setAmplifyPhase('failed')
+            setAmplifyOn(false)
+            setAmplifyError({ key: 'error.build-failed', params: { message: 'the summary run stopped reporting' } })
+            return
+          }
+          const slice = new AbortController()
+          request.current = slice
+          let tick
+          try {
+            tick = await fetch(routeUrl(AMPLIFY_STATUS_ROUTE), {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: '{}',
+              signal: slice.signal,
+            })
+          }
+          catch (error) {
+            if (slice.signal.aborted) return
+            throw error
+          }
+          const status = await tick.json()
+          if (status === null || typeof status !== 'object') continue
+          setAmplifyProgress({ count: status.chunkCount || 0 })
+          if (typeof status.tokens === 'number') setAmplifyTokens(status.tokens)
+          if (status.state === 'stalled') {
+            setAmplifyPhase('stalled')
+            setAmplifyStall({ reason: status.stallReason, tokens: status.tokens || 0, expected: status.expectedTokens || 0 })
+            // Keep polling: the run resumes once the user answers.
+            continue
+          }
+          if (status.state === 'done' && typeof status.summary === 'string') {
+            setAmplifySummary(status.summary)
+            setAmplifyPhase('done')
+            return
+          }
+          if (status.state === 'failed' || status.state === 'cancelled' || status.state === 'abandoned') {
+            setAmplifyPhase(status.state === 'abandoned' ? 'cancelled' : status.state)
+            setAmplifyOn(false)
+            setAmplifySummary(null)
+            return
+          }
+        }
+      }, [])
+
+      /** Run one amplify round and hand the work to one summary session. */
+      const runAmplify = useCallback(async () => {
+        if (selected === undefined || archive === null) return
+        setAmplifyDialog(false)
+        setAmplifyPhase('running')
+        // A summary left over from an earlier run must never be folded into this one.
+        setAmplifySummary(null)
+        // Every new run starts centred again, even if the panel was dragged last time.
+        setFloatPos(null)
+        setAmplifyMin(true)
+        setAmplifyStartedAt(Date.now())
+        setAmplifyProgress({ count: amplifyPlan === null ? 0 : amplifyPlan.segments.length })
+        try {
+          const started = await fetch(routeUrl(AMPLIFY_START_ROUTE), {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+              conversationId: selected.id,
+              keepTurns: keep,
+              workspaceId: chosenWorkspaceId,
+              locale: activeLocaleId(),
+            }),
+          })
+          const payload = await started.json()
+          if (payload === null || typeof payload !== 'object' || payload.ok !== true) {
+            setAmplifyPhase('failed')
+            setAmplifyOn(false)
+            setAmplifyError(errorFromPayload(payload))
+            return
+          }
+          await pollAmplify()
+        }
+        catch (thrown) {
+          if (request.current !== null && request.current.signal.aborted) return
+          setAmplifyPhase('failed')
+          setAmplifyOn(false)
+          setAmplifyError({ key: 'error.build-failed', params: { message: messageOf(thrown) } })
+        }
+      }, [amplifyPlan, archive, chosenWorkspaceId, keep, selected, pollAmplify])
+
+      /**
+       * A wizard reopened while a run is still going has to show that run again: the Host
+       * owns the state, so ask it once on mount and resume polling if anything is active.
+       */
+      useEffect(() => {
+        let alive = true
+        void (async () => {
+          try {
+            const response = await fetch(routeUrl(AMPLIFY_STATUS_ROUTE), {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: '{}',
+            })
+            const status = await response.json()
+            if (!alive || status === null || typeof status !== 'object' || status.ok !== true) return
+            // Only a run that is still going can be shown again; a finished one would have no
+            // conversation loaded on this mount, so its summary could not be used anyway.
+            if (!['creating', 'running', 'summarizing', 'stalled'].includes(status.state)) return
+            setAmplifyOn(true)
+            setAmplifyMin(true)
+            setAmplifyStartedAt(Date.now() - (typeof status.elapsedMs === 'number' ? status.elapsedMs : 0))
+            setAmplifyProgress({ count: status.chunkCount || 0 })
+            setAmplifyTokens(typeof status.tokens === 'number' ? status.tokens : 0)
+            if (status.state === 'stalled') {
+              setAmplifyPhase('stalled')
+              setAmplifyStall({ reason: status.stallReason, tokens: status.tokens || 0, expected: status.expectedTokens || 0 })
+            }
+            else {
+              setAmplifyPhase('running')
+            }
+            await pollAmplify()
+          }
+          catch {
+            /* no run to recover */
+          }
+        })()
+        return () => { alive = false }
+      }, [pollAmplify])
+
+      /** Stop the run; the summary is discarded on purpose. */
+      const cancelAmplify = useCallback(async () => {
+        try {
+          await fetch(routeUrl(AMPLIFY_CANCEL_ROUTE), {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: '{}',
+          })
+        }
+        catch {
+          /* the run is abandoned either way */
+        }
+        setAmplifyPhase('cancelled')
+        setAmplifySummary(null)
+        setAmplifyStall(null)
+      }, [])
+
+      /** Answer a parked run: keep waiting, cancel, or continue without the summary. */
+      const decideAmplify = useCallback(async (decision) => {
+        setAmplifyStall(null)
+        try {
+          await fetch(routeUrl(AMPLIFY_DECIDE_ROUTE), {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ decision }),
+          })
+        }
+        catch {
+          /* the poll loop reports the outcome either way */
+        }
+        if (decision === 'continue') setAmplifyPhase('running')
+        else {
+          setAmplifyPhase('cancelled')
+          setAmplifySummary(null)
+          setAmplifyOn(false)
+        }
+      }, [])
+
       const generate = useCallback(async () => {
         if (selected === undefined || archive === null) return
         setBusy('build')
@@ -661,6 +975,7 @@ window.__ModuleLoader__.load({
               keepTurns: keep,
               locale: activeLocaleId(),
               note,
+              ...(amplifySummary === null ? {} : { amplifySummary }),
             }),
           })
           if (!response.ok) {
@@ -704,7 +1019,7 @@ window.__ModuleLoader__.load({
         finally {
           setBusy('')
         }
-      }, [archive, chosenWorkspaceId, keep, note, selected])
+      }, [archive, chosenWorkspaceId, keep, note, selected, amplifySummary])
 
       const startOver = () => {
         setArchive(null)
@@ -729,19 +1044,34 @@ window.__ModuleLoader__.load({
 
       const stepNumber = step === 'upload' ? 1 : step === 'pick' ? 2 : 3
       const running = busy !== ''
+      /** Both wizard buttons stay locked until the run is cancelled or settled. */
+      const amplifiedBusyLock = amplifyPhase === 'running' || amplifyPhase === 'stalled'
 
       const header = h('div', { className: 'dsh-slim-head' },
         h('div', { className: 'dsh-slim-titlebox' },
           h('h2', { className: 'dsh-slim-title', id: 'dsh-slim-title' }, t('dialog.title')),
           h('p', { className: 'dsh-slim-steps' }, t('dialog.step', { step: String(stepNumber) })),
         ),
-        h('button', {
-          type: 'button',
-          className: 'dsh-slim-icon-button',
-          'aria-label': t('dialog.close'),
-          title: t('dialog.close'),
-          onClick: onClose,
-        }, '×'),
+        // Keep both icon buttons pinned to the top-right corner: as direct children
+        // of the space-between header, an odd third child would drift to the centre.
+        h('div', { className: 'dsh-slim-head-actions' },
+          (amplifyPhase === 'running' || amplifyPhase === 'stalled')
+            ? h('button', {
+              type: 'button',
+              className: 'dsh-slim-icon-button',
+              'aria-label': t('amplify.minimize'),
+              title: t('amplify.minimize'),
+              onClick: () => { setAmplifyMin(true) },
+            }, '⤡')
+            : null,
+          h('button', {
+            type: 'button',
+            className: 'dsh-slim-icon-button',
+            'aria-label': t('dialog.close'),
+            title: t('dialog.close'),
+            onClick: requestClose,
+          }, '×'),
+        ),
       )
 
       const errorLine = error === null ? null : h('div', { className: 'dsh-slim-error', role: 'alert' }, errorText(t, error))
@@ -942,6 +1272,54 @@ window.__ModuleLoader__.load({
                 onChange: (event) => { setWorkspaceId(event.target.value) },
               }, workspaceOptions),
           ),
+          dropped > 0
+            ? h('div', { className: 'dsh-slim-field' },
+              h('div', { className: 'dsh-slim-nuke' },
+                h('button', {
+                  type: 'button',
+                  className: `dsh-slim-nuke-btn${amplifyOn ? ' dsh-slim-nuke-on' : ''}`,
+                  'aria-pressed': amplifyOn ? 'true' : 'false',
+                  'aria-label': t('step.config.amplify'),
+                  title: t('step.config.amplify'),
+                  disabled: running || amplifyPhase === 'running',
+                  onClick: () => {
+                    const next = !amplifyOn
+                    setAmplifyOn(next)
+                    setAmplifySummary(null)
+                    if (next) void openAmplify()
+                    else setAmplifyPhase('idle')
+                  },
+                }, h('span', { className: 'dsh-slim-nuke-icon', 'aria-hidden': 'true' }, '☢')),
+                h('span', { className: 'dsh-slim-nuke-label' }, t('step.config.amplify')),
+              ),
+              h('p', { className: 'dsh-slim-note' }, t('step.config.amplifyHint', { count: String(dropped) })),
+              amplifyPhase === 'planning' ? h('p', { className: 'dsh-slim-note', role: 'status' }, t('amplify.planning')) : null,
+              amplifyPhase === 'running'
+                ? h('p', { className: 'dsh-slim-note', role: 'status' },
+                  t('amplify.progress', { count: String(amplifyProgress.count) }))
+                : null,
+              amplifyPhase === 'running'
+                ? h('button', { type: 'button', className: 'dsh-slim-button', onClick: () => { void cancelAmplify() } }, t('amplify.cancel'))
+                : null,
+              amplifyPhase === 'stalled' && amplifyStall !== null
+                ? h('div', { className: 'dsh-slim-field' },
+                  h('p', { className: 'dsh-slim-warn' }, t('amplify.stalledTime')),
+                  h('div', { className: 'dsh-slim-keeprow' },
+                    h('button', { type: 'button', className: 'dsh-slim-button', onClick: () => { void decideAmplify('continue') } }, t('amplify.keepWaiting')),
+                    h('button', { type: 'button', className: 'dsh-slim-button', onClick: () => { void decideAmplify('cancel') } }, t('amplify.stopHere')),
+                    h('button', { type: 'button', className: 'dsh-slim-button dsh-slim-primary', onClick: () => { void decideAmplify('without') } }, t('amplify.without')),
+                  ),
+                )
+                : null,
+              amplifyPhase === 'done'
+                ? h('p', { className: 'dsh-slim-note' }, t('amplify.done'))
+                : null,
+              amplifyPhase === 'cancelled' || amplifyPhase === 'failed'
+                ? h('p', { className: 'dsh-slim-warn' }, t(amplifyPhase === 'cancelled' ? 'amplify.cancelled' : 'amplify.failed'))
+                : null,
+              amplifyError === null ? null : h('div', { className: 'dsh-slim-error', role: 'alert' }, errorText(t, amplifyError)),
+            )
+            : null,
           errorLine,
           busy === 'build' ? h('p', { className: 'dsh-slim-note', role: 'status' }, t('dialog.building')) : null,
           busy === 'import' ? h('p', { className: 'dsh-slim-note', role: 'status' }, t('dialog.importing')) : null,
@@ -950,15 +1328,21 @@ window.__ModuleLoader__.load({
           h('button', {
             type: 'button',
             className: 'dsh-slim-button',
-            disabled: running,
+            disabled: running || amplifiedBusyLock,
             onClick: () => { setStep('pick') },
           }, t('dialog.back')),
           h('button', {
             type: 'button',
             className: 'dsh-slim-button dsh-slim-primary',
-            disabled: running || selected === undefined,
+            // Two writers racing on the session store once emptied the whole sidebar,
+            // so building waits until the amplify run has settled.
+            disabled: running || selected === undefined || amplifyPhase === 'running' || amplifyPhase === 'stalled',
             onClick: () => { void generate() },
-          }, running ? t('dialog.importing') : t('step.config.generate')),
+          }, running
+            ? t('dialog.importing')
+            : amplifyPhase === 'running' || amplifyPhase === 'stalled'
+              ? t('step.config.waitAmplify')
+              : t('step.config.generate')),
         )
       }
       else {
@@ -985,15 +1369,139 @@ window.__ModuleLoader__.load({
         )
       }
 
-      return h('div', { className: 'dsh-slim-overlay', role: 'presentation' },
-        h('div', {
-          className: 'dsh-slim-dialog',
-          role: 'dialog',
-          'aria-modal': 'true',
-          'aria-labelledby': 'dsh-slim-title',
-          tabIndex: -1,
-          ref: surface,
-        }, header, body, footer),
+      /** Display name of the workspace the summary session will join. */
+      const workspaceNameOf = (id) => {
+        for (const workspace of workspaces) {
+          if (workspace !== null && typeof workspace === 'object' && workspace.workspaceId === id) {
+            return typeof workspace.title === 'string' && workspace.title !== '' ? workspace.title : id
+          }
+        }
+        return typeof id === 'string' ? id : ''
+      }
+
+      const amplifyWarn = amplifyDialog && amplifyPlan !== null        ? h('div', { className: 'dsh-slim-overlay', role: 'presentation' },
+          h('div', {
+            className: 'dsh-slim-dialog',
+            role: 'dialog',
+            'aria-modal': 'true',
+            'aria-labelledby': 'dsh-slim-amplify-title',
+            tabIndex: -1,
+          },
+            h('div', { className: 'dsh-slim-head' },
+              h('div', { className: 'dsh-slim-titlebox' },
+                h('h2', { className: 'dsh-slim-title', id: 'dsh-slim-amplify-title' }, t('amplify.title')),
+              ),
+            ),
+            h('div', { className: 'dsh-slim-body' },
+              h('p', { className: 'dsh-slim-summary-line' },
+                t('amplify.lead', { count: String(amplifyPlan.removedTurns) })),
+              h('ul', { className: 'dsh-slim-bullets' },
+                h('li', null, t('amplify.workspace', { name: workspaceNameOf(chosenWorkspaceId) })),
+                h('li', null, t('amplify.model')),
+                h('li', null, t('amplify.segments', { count: String(amplifyPlan.segments.length) })),
+                h('li', null, t('amplify.tokens', { tokens: formatTokens(amplifyPlan.tokens) })),
+                h('li', null, t('amplify.cache')),
+                h('li', null, t('amplify.failure')),
+              ),
+            ),
+            h('div', { className: 'dsh-slim-foot' },
+              h('button', {
+                type: 'button',
+                className: 'dsh-slim-button',
+                onClick: () => { setAmplifyDialog(false); setAmplifyOn(false); setAmplifyPhase('idle') },
+              }, t('dialog.cancel')),
+              h('button', {
+                type: 'button',
+                className: 'dsh-slim-button dsh-slim-primary',
+                onClick: () => { void runAmplify() },
+              }, t('amplify.confirm')),
+            ),
+          ),
+        )
+        : null
+
+      // While minimized the wizard collapses to a floating panel, so the rest of DSH
+      // stays usable and the run is still visible.
+      const amplifiedBusy = amplifyPhase === 'running' || amplifyPhase === 'stalled'
+      if (amplifyMin && amplifiedBusy) {
+        const elapsedSeconds = amplifyStartedAt === 0 ? 0 : Math.max(0, Math.round((Date.now() - amplifyStartedAt) / 1000))
+        const dragHandlers = {
+          onPointerDown: (event) => {
+            const panel = event.currentTarget.parentElement
+            if (panel === null) return
+            const box = panel.getBoundingClientRect()
+            floatDrag.current = { dx: event.clientX - box.left, dy: event.clientY - box.top }
+            setFloatPos({ x: box.left, y: box.top })
+            if (typeof event.currentTarget.setPointerCapture === 'function') {
+              try {
+                event.currentTarget.setPointerCapture(event.pointerId)
+              }
+              catch {
+                /* capture is a nicety, dragging works without it */
+              }
+            }
+          },
+          onPointerMove: (event) => {
+            const drag = floatDrag.current
+            if (drag === null) return
+            const width = event.currentTarget.parentElement === null ? 260 : event.currentTarget.parentElement.offsetWidth
+            const maxX = Math.max(8, window.innerWidth - width - 8)
+            const maxY = Math.max(8, window.innerHeight - 60)
+            setFloatPos({
+              x: Math.max(8, Math.min(maxX, event.clientX - drag.dx)),
+              y: Math.max(8, Math.min(maxY, event.clientY - drag.dy)),
+            })
+          },
+          onPointerUp: () => { floatDrag.current = null },
+          onPointerCancel: () => { floatDrag.current = null },
+        }
+        return h('div', {
+          className: 'dsh-slim-float',
+          role: 'status',
+          style: floatPos === null
+            ? undefined
+            // Clear right/bottom while dragging: with top+bottom both set and height auto
+            // the box would stretch from edge to edge instead of keeping its size.
+            // transform must go too, or the centred translate would offset the new left/top.
+            : { left: `${floatPos.x}px`, top: `${floatPos.y}px`, right: 'auto', bottom: 'auto', transform: 'none' },
+        },
+          h('div', { className: 'dsh-slim-float-head', style: { cursor: 'grab', touchAction: 'none' }, ...dragHandlers },
+            h('span', { className: 'dsh-slim-float-title' }, t('amplify.miniTitle')),
+            h('div', { className: 'dsh-slim-head-actions' },
+              h('button', {
+                type: 'button',
+                className: 'dsh-slim-icon-button',
+                onPointerDown: (event) => { event.stopPropagation() },
+                onClick: () => { setAmplifyMin(false) },
+                'aria-label': t('amplify.expand'),
+                title: t('amplify.expand'),
+              }, '⤢'),
+              h('span', { className: 'dsh-slim-float-spacer', 'aria-hidden': 'true' }),
+            ),
+          ),
+          h('p', { className: 'dsh-slim-float-line' }, t('amplify.progress', { count: String(amplifyProgress.count) })),
+          h('p', { className: 'dsh-slim-float-meta' },
+            `${formatElapsed(elapsedSeconds)} · ${formatTokens(amplifyTokens)} token`),
+          h('button', {
+            type: 'button',
+            className: 'dsh-slim-button',
+            onClick: () => { void cancelAmplify() },
+          }, t('amplify.cancel')),
+        )
+      }
+
+      return h(React.Fragment, null,
+        h('div', { className: 'dsh-slim-overlay', role: 'presentation' },
+          h('div', {
+            className: 'dsh-slim-dialog',
+            role: 'dialog',
+            'aria-modal': 'true',
+            'aria-labelledby': 'dsh-slim-title',
+            tabIndex: -1,
+            ref: surface,
+          }, header, body, footer),
+        ),
+        amplifyWarn,
       )
     }
 
@@ -1050,6 +1558,7 @@ window.__ModuleLoader__.load({
 .dsh-slim-dialog{display:flex;flex-direction:column;width:min(620px,100%);max-height:min(86vh,760px);border:1px solid var(--dsw-alias-border-subtle,rgba(128,128,128,.32));border-radius:12px;background:var(--dsw-alias-bg-elevated,Canvas);color:var(--dsw-alias-text-primary,CanvasText);box-shadow:0 16px 48px rgba(0,0,0,.38);font:inherit;font-size:13px;line-height:1.5;overflow:hidden}
 .dsh-slim-dialog:focus{outline:none}
 .dsh-slim-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;padding:16px 18px 8px}
+.dsh-slim-head-actions{display:flex;align-items:center;gap:2px;flex:0 0 auto}
 .dsh-slim-titlebox{display:flex;flex-direction:column;gap:2px;min-width:0}
 .dsh-slim-title{margin:0;font-size:15px;font-weight:600}
 .dsh-slim-steps{margin:0;font-size:12px;color:var(--dsw-alias-text-secondary,GrayText)}
@@ -1086,11 +1595,29 @@ window.__ModuleLoader__.load({
 .dsh-slim-meta-item{white-space:nowrap}
 .dsh-slim-badge{padding:1px 7px;border:1px solid currentColor;border-radius:999px;font-size:11px;white-space:nowrap;flex:0 0 auto}
 .dsh-slim-badge-warn{color:var(--dsw-alias-text-warning,#b45309)}
-.dsh-slim-badge-ok{color:var(--dsw-alias-text-secondary,GrayText)}
 .dsh-slim-field{display:flex;flex-direction:column;gap:6px}
 .dsh-slim-label{font-weight:500}
 .dsh-slim-keeprow{display:flex;align-items:center;gap:10px}
 .dsh-slim-range{flex:1 1 auto;accent-color:var(--dsw-alias-brand-primary,Highlight)}
+.dsh-slim-float{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);right:auto;bottom:auto;z-index:1200;display:flex;flex-direction:column;gap:6px;box-sizing:border-box;width:260px;max-width:calc(100vw - 40px);padding:10px 12px;border:1px solid var(--dsw-alias-border-subtle,rgba(128,128,128,.32));border-radius:12px;background:var(--dsw-alias-bg-elevated,Canvas);color:var(--dsw-alias-text-primary,CanvasText);box-shadow:0 12px 32px rgba(0,0,0,.28);font:inherit;font-size:12px}
+.dsh-slim-float-head{display:flex;align-items:center;justify-content:space-between;gap:8px}
+/* Matches the width the dialog header spends on its close button, so the expand
+   icon lands right on top of the collapse icon instead of jumping when toggled. */
+.dsh-slim-float-spacer{width:28px;height:1px;flex:0 0 auto}
+.dsh-slim-float-title{font-weight:600}
+.dsh-slim-float-line{margin:0}
+.dsh-slim-float-meta{margin:0;color:var(--dsw-alias-text-secondary,GrayText)}
+.dsh-slim-nuke{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+/* Bare glyph: no border, no fill, no circle - just the symbol as the hit target. */
+.dsh-slim-nuke-btn{display:inline-flex;align-items:center;justify-content:center;width:30px;height:30px;flex:0 0 auto;padding:0;border:0;border-radius:0;background:none;color:var(--dsw-alias-text-secondary,GrayText);cursor:pointer;transition:color .15s,text-shadow .15s,transform .15s}
+.dsh-slim-nuke-btn:hover:not(:disabled){color:var(--dsw-alias-text-primary,CanvasText);transform:scale(1.08)}
+.dsh-slim-nuke-btn:active:not(:disabled){transform:scale(.96)}
+.dsh-slim-nuke-btn:disabled{opacity:.45;cursor:default}
+.dsh-slim-nuke-btn:focus-visible{outline:2px solid var(--dsw-alias-brand-primary,Highlight);outline-offset:2px}
+.dsh-slim-nuke-icon{font-size:20px;line-height:1}
+.dsh-slim-nuke-on{color:var(--dsw-alias-text-warning,#b45309);text-shadow:0 0 8px rgba(180,83,9,.55)}
+.dsh-slim-nuke-label{font-weight:500}
+.dsh-slim-bullets{margin:0;padding-left:18px;display:flex;flex-direction:column;gap:4px;font-size:12px;color:var(--dsw-alias-text-secondary,GrayText)}
 `
 
     return {

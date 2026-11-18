@@ -1,7 +1,27 @@
 {
   "name": "dsh-revive-love",
-  "version": "1.1.1",
+  "version": "1.2.2",
   "description": "Unofficial third-party DSH plugin: revive an over-long DeepSeek chat export by importing only its most recent turns.",
+  "keywords": [
+    "context",
+    "deepseek",
+    "dsh",
+    "dsh-plugin",
+    "harness",
+    "import",
+    "revive",
+    "session"
+  ],
+  "homepage": "https://github.com/123kiana/dsh-revive-love#readme",
+  "bugs": {
+    "url": "https://github.com/123kiana/dsh-revive-love/issues"
+  },
+  "license": "MIT",
+  "author": "123kiana",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/123kiana/dsh-revive-love.git"
+  },
   "type": "module",
   "main": "index.js",
   "exports": {
@@ -13,17 +33,24 @@
     "./icon": "./icon.svg"
   },
   "files": [
+    "amplify.js",
     "index.js",
     "client.js",
     "cordis.patch.yml",
     "locale/*.json",
-    "docs",
+    "docs/*.md",
     "icon.svg",
     "README.md",
     "LICENSE",
     "SECURITY.md",
     "CHANGELOG.md"
   ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "check": "node --check index.js && node --check client.js && node --check amplify.js"
+  },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
@@ -38,25 +65,5 @@
         "@deepseek-ai/dsh-client-ui-sidebar"
       ]
     }
-  },
-  "license": "MIT",
-  "keywords": [
-    "deepseek",
-    "harness",
-    "dsh",
-    "dsh-plugin",
-    "session",
-    "context",
-    "import",
-    "revive"
-  ],
-  "author": "123kiana",
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/123kiana/dsh-revive-love"
-  },
-  "homepage": "https://github.com/123kiana/dsh-revive-love#readme",
-  "bugs": {
-    "url": "https://github.com/123kiana/dsh-revive-love/issues"
   }
 }

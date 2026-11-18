@@ -22,17 +22,18 @@
  * them for the user to import with the shipped import action. This plugin
  * never writes a `session*.jsonl*` log itself.
  *
- * ZIP reading/writing is implemented on `node:zlib` only: a profile-installed
- * package cannot resolve `@deepseek-ai/*` or third-party bundles, so the
- * archive layer mirrors the shipped importer's semantics without its
- * dependencies.
+ * ZIP reading/writing is implemented on `node:zlib` only, following the export
+ * format (`export_format_version: 3`) that the DeepSeek website produces: a
+ * profile-installed package cannot resolve `@deepseek-ai/*` or third-party
+ * bundles, so the archive layer is written from scratch against that format.
  */
 
 import { createHash, randomUUID } from 'node:crypto'
-import { readFileSync, readdirSync, statSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, join, resolve } from 'node:path'
 import { inflateRawSync } from 'node:zlib'
+import { chunkTurns, createAmplifyRunner, estimateTokensOf } from './amplify.js'
 
 /** The plugin's own identity, echoed by the patch row and the client bundle. */
 export const name = 'session-slim'
@@ -55,6 +56,12 @@ export const BUILD_ROUTE = '/dsh-session-slim/build'
 export const SCAN_ROUTE = '/dsh-session-slim/scan'
 /** Loads one archive found by the scan, so the wizard skips the file picker. */
 export const OPEN_ROUTE = '/dsh-session-slim/scan-open'
+/** Amplify mode: plan the segmentation, run it, poll it, cancel it, answer a stall. */
+export const AMPLIFY_PLAN_ROUTE = '/dsh-session-slim/amplify/plan'
+export const AMPLIFY_START_ROUTE = '/dsh-session-slim/amplify/start'
+export const AMPLIFY_STATUS_ROUTE = '/dsh-session-slim/amplify/status'
+export const AMPLIFY_CANCEL_ROUTE = '/dsh-session-slim/amplify/cancel'
+export const AMPLIFY_DECIDE_ROUTE = '/dsh-session-slim/amplify/decide'
 
 /** Filename shape of a DeepSeek website export. */
 const SCAN_PATTERN = /^deepseek_data.*\.zip$/i
@@ -71,14 +78,20 @@ const MAX_ARCHIVE_BYTES = 256 * 1024 * 1024
 /** Largest inflated size of one archive entry; keeps a zip bomb from exhausting memory. */
 const MAX_ENTRY_BYTES = 256 * 1024 * 1024
 
-/** Largest accepted JSON request body (the build parameters). */
+/** Largest accepted JSON body for the light routes (scan-open and the amplify routes). */
 const MAX_JSON_BYTES = 8192
+/**
+ * `/build` additionally carries the amplify summary, which is allowed to be 400k
+ * characters. At 3 bytes per CJK character that is over 1 MiB, so the light-route
+ * limit above would reject every real summary after the model already ran.
+ */
+const MAX_BUILD_JSON_BYTES = 2 * 1024 * 1024
 
 /** Most conversations one preview inspects, newest `updated_at` first. */
 const MAX_PREVIEW_CONVERSATIONS = 200
 
-/** Per-turn character counts carried to the browser; older turns are summarized. */
-const MAX_TURN_CHARS = 1500
+/** Most per-turn samples carried to the browser; older turns are summarized instead. */
+const MAX_TURN_SAMPLES = 1500
 
 /** How long an uploaded archive stays available for a `build` call. */
 const PENDING_TTL_MS = 15 * 60 * 1000
@@ -87,9 +100,19 @@ const PENDING_TTL_MS = 15 * 60 * 1000
 const MANIFEST_ENTRY = 'manifest.json'
 /** `chat_session_index.json` entry name. */
 const INDEX_ENTRY = 'chat_session_index.json'
+/** A conversation id that is safe to place in a zip entry name. */
+const SAFE_CONVERSATION_ID = /^[A-Za-z0-9_-]{1,128}$/
+
 /** A conversation entry name; the id is the entry name. */
 function conversationEntryName(id) {
   return `chat_sessions/${id}.json`
+}
+
+/** Recover a conversation id from its entry name. */
+function entryNameToId(entryName) {
+  const base = String(entryName).split('/').pop() || ''
+  const id = base.endsWith('.json') ? base.slice(0, -5) : base
+  return SAFE_CONVERSATION_ID.test(id) ? id : 'unknown'
 }
 
 /** Context facts the picker marks conversations with. */
@@ -106,11 +129,13 @@ const NOTICES = {
     suffix: '（复活版）',
     ack: '（历史摘要｜本会话复活自「{title}」：保留最近 {kept} 轮原文，更早的 {removed} 轮已移除。）',
     untitled: '未命名会话',
+    summaryHeader: '【较早内容的摘要｜由增幅模式生成】',
   },
   en: {
     suffix: ' (revived)',
     ack: '(History summary — this conversation was revived from "{title}": the most recent {kept} turns are kept and the earlier {removed} turns are removed.)',
     untitled: 'Untitled conversation',
+    summaryHeader: '[Summary of the earlier part | produced by amplify mode]',
   },
 }
 
@@ -138,17 +163,31 @@ function sendJson(response, status, value) {
   response.end(JSON.stringify(value))
 }
 
-/** A present Origin must match the request Host (same-origin browsers only). */
+/**
+ * A present Origin must match the request Host (same-origin browsers only), and the
+ * Host must be a loopback name. Without the loopback check a page on `evil.com` that
+ * rebinds that name to 127.0.0.1 would present matching Origin and Host and reach the
+ * folder scan and build routes. Requests without Origin are allowed so that non-browser
+ * clients on the same machine (curl, scripts) keep working.
+ */
 function sameOrigin(request) {
+  const host = request.headers.host
+  if (host === undefined || host === '') return false
+  if (!isLoopbackHost(host)) return false
   const origin = request.headers.origin
   if (origin === undefined || origin === '') return true
   try {
-    const host = request.headers.host
-    return host !== undefined && new URL(origin).host === host
+    return new URL(origin).host === host
   }
   catch {
     return false
   }
+}
+
+/** Whether a `Host` header names the local machine. */
+function isLoopbackHost(host) {
+  const name = host.replace(/:\d+$/, '').toLowerCase()
+  return name === '127.0.0.1' || name === 'localhost' || name === '[::1]' || name === '::1'
 }
 
 /**
@@ -508,8 +547,13 @@ function parseConversation(bytes, entryName) {
   const current = typeof parsed.current_message_id === 'number' && Number.isSafeInteger(parsed.current_message_id)
     ? parsed.current_message_id
     : undefined
+  // The id ends up in a zip entry name (`chat_sessions/<id>.json`) and in the download
+  // filename, so an id carrying `../` or a separator must never reach buildZip.
+  const id = typeof parsed.id === 'string' && SAFE_CONVERSATION_ID.test(parsed.id)
+    ? parsed.id
+    : entryNameToId(entryName)
   return {
-    id: parsed.id,
+    id,
     title: typeof parsed.title === 'string' ? parsed.title : '',
     insertedAt: typeof parsed.inserted_at === 'string' ? parsed.inserted_at : '',
     currentMessageId: current,
@@ -615,11 +659,11 @@ function turnTokens(turns) {
 function turnCharsOf(turns) {
   const chars = turns.map(turn => turn.chars)
   const tokens = turns.map(turn => Math.max(1, Math.round(textTokens(turn.userText) + textTokens(turn.replyText))))
-  if (chars.length <= MAX_TURN_CHARS) return { turnChars: chars, turnTokens: tokens, turnCharsOffset: 0 }
+  if (chars.length <= MAX_TURN_SAMPLES) return { turnChars: chars, turnTokens: tokens, turnCharsOffset: 0 }
   return {
-    turnChars: chars.slice(chars.length - MAX_TURN_CHARS),
-    turnTokens: tokens.slice(tokens.length - MAX_TURN_CHARS),
-    turnCharsOffset: chars.length - MAX_TURN_CHARS,
+    turnChars: chars.slice(chars.length - MAX_TURN_SAMPLES),
+    turnTokens: tokens.slice(tokens.length - MAX_TURN_SAMPLES),
+    turnCharsOffset: chars.length - MAX_TURN_SAMPLES,
   }
 }
 
@@ -735,10 +779,11 @@ export function summarizeArchive(buffer) {
  * @param keepTurns - USER turns to keep, counted from the newest.
  * @param locale - locale id choosing the notice language and title suffix.
  * @param note - optional USER text inserted as the archive's first message.
+ * @param amplifySummary - optional summary of the discarded turns; replaces the note.
  * @returns the new archive bytes plus its summary.
  * @throws {SlimError} for an unknown entry or a conversation with no USER turn.
  */
-export function buildSlimArchive(buffer, entryName, keepTurns, locale, note) {
+export function buildSlimArchive(buffer, entryName, keepTurns, locale, note, amplifySummary) {
   const entries = readZipIndex(buffer)
   const entry = entries.get(entryName)
   if (entry === undefined) throw new SlimError('unknown-conversation', `the archive has no entry ${entryName}`)
@@ -769,7 +814,16 @@ export function buildSlimArchive(buffer, entryName, keepTurns, locale, note) {
   }
   let at = baseTime - 2
   const noteText = typeof note === 'string' ? note.trim() : ''
-  if (noteText !== '') {
+  const summaryText = typeof amplifySummary === 'string' ? amplifySummary.trim() : ''
+  if (summaryText !== '') {
+    // Amplify mode: the summary replaces the bare marker, so the revived session
+    // starts with what the discarded turns said rather than a count.
+    push('USER', `${dictionary.summaryHeader}\n\n${summaryText}`, at)
+    at += 1
+    push('ASSISTANT', fillNotice(dictionary.ack, { removed: String(removed), kept: String(kept.length), title }), at)
+    at += 1
+  }
+  else if (noteText !== '') {
     const params = { removed: String(removed), kept: String(kept.length), title }
     push('USER', noteText, at)
     at += 1
@@ -886,9 +940,11 @@ export function previewHandler(ctx) {
 /**
  * Route handler: `POST /dsh-session-slim/build`.
  * @param ctx - host context.
+ * @param runner - the amplify runner, which must not be mid-run: two writers racing
+ *   on the same session store is what emptied the session list once already.
  * @returns the Node request handler.
  */
-export function buildHandler(ctx) {
+export function buildHandler(ctx, runner) {
   return async (request, response) => {
     if (request.method !== 'POST') {
       response.writeHead(405, { allow: 'POST' })
@@ -899,16 +955,24 @@ export function buildHandler(ctx) {
       sendJson(response, 403, { ok: false, code: 'origin' })
       return
     }
+    if (runner !== undefined && runner.isActive()) {
+      sendJson(response, 409, {
+        ok: false,
+        code: 'amplify-busy',
+        error: 'an amplify run is in progress; wait for it or cancel it before building',
+      })
+      return
+    }
     let body
     try {
-      body = await readBoundedBody(request, MAX_JSON_BYTES)
+      body = await readBoundedBody(request, MAX_BUILD_JSON_BYTES)
     }
     catch (error) {
       sendJson(response, 400, { ok: false, code: 'bad-request', error: String(error?.message ?? error) })
       return
     }
     if (body === undefined) {
-      sendJson(response, 413, { ok: false, code: 'too-large', error: `the request exceeds ${MAX_JSON_BYTES} bytes` })
+      sendJson(response, 413, { ok: false, code: 'too-large', error: `the request exceeds ${MAX_BUILD_JSON_BYTES} bytes` })
       return
     }
     let params
@@ -924,6 +988,15 @@ export function buildHandler(ctx) {
     const keepTurns = isRecord(params) ? params.keepTurns : undefined
     const locale = isRecord(params) ? params.locale : undefined
     const note = isRecord(params) ? params.note : undefined
+    const amplifySummary = isRecord(params) ? params.amplifySummary : undefined
+    if (amplifySummary !== undefined && typeof amplifySummary !== 'string') {
+      sendJson(response, 400, { ok: false, code: 'bad-request', error: 'amplifySummary must be a string' })
+      return
+    }
+    if (typeof amplifySummary === 'string' && amplifySummary.length > 400_000) {
+      sendJson(response, 400, { ok: false, code: 'bad-request', error: 'amplifySummary is longer than 400000 characters' })
+      return
+    }
     if (note !== undefined && typeof note !== 'string') {
       sendJson(response, 400, { ok: false, code: 'bad-request', error: 'note must be a string' })
       return
@@ -960,6 +1033,7 @@ export function buildHandler(ctx) {
         keepTurns,
         locale,
         note,
+        amplifySummary,
       )
       response.writeHead(200, {
         'content-type': 'application/zip',
@@ -1171,20 +1245,381 @@ export function openHandler(ctx) {
   }
 }
 
+// ── amplify routes ──────────────────────────────────────────────────────────
+
+/** Read a JSON request body, answering the refusal itself when unusable. */
+async function readJsonBody(request, response) {
+  let body
+  try {
+    body = await readBoundedBody(request, MAX_JSON_BYTES)
+  }
+  catch (error) {
+    sendJson(response, 400, { ok: false, code: 'bad-request', error: String(error?.message ?? error) })
+    return undefined
+  }
+  try {
+    return JSON.parse(body.toString('utf8'))
+  }
+  catch {
+    sendJson(response, 400, { ok: false, code: 'bad-request', error: 'the request is not valid JSON' })
+    return undefined
+  }
+}
+
+/** The pending upload, or a refusal already sent. */
+function requirePending(response) {
+  if (pendingUpload === undefined) {
+    sendJson(response, 409, { ok: false, code: 'expired-upload', error: 'upload the archive again' })
+    return undefined
+  }
+  if (Date.now() - pendingUpload.at > PENDING_TTL_MS) {
+    clearPending()
+    sendJson(response, 409, { ok: false, code: 'expired-upload', error: 'the uploaded archive expired; upload it again' })
+    return undefined
+  }
+  return pendingUpload
+}
+
+/**
+ * Read the chosen conversation and split its dropped turns into segments.
+ * Parsing one conversation means inflating and JSON-parsing a large archive, so the
+ * result is cached: `plan`/`start`/`build` all ask for the same thing in one flow, and
+ * doing that work three times blocked the host event loop (which emptied the sidebar).
+ * @param buffer - the archive bytes.
+ * @param entryName - conversation entry name.
+ * @param keepTurns - turns to keep.
+ * @returns plan with `kept`, `dropped`, `chunks`, `chars`, `tokens`; the plan route
+ *   re-labels `chunks` as `segments` for the browser.
+ * @throws {SlimError} for an unknown or empty conversation.
+ */
+export function planAmplify(buffer, entryName, keepTurns) {
+  const cacheKey = `${entryName}#${keepTurns}`
+  if (planCache !== undefined && planCache.key === cacheKey && planCache.buffer === buffer) {
+    return planCache.plan
+  }
+  const entries = readZipIndex(buffer)
+  const entry = entries.get(entryName)
+  if (entry === undefined) throw new SlimError('unknown-conversation', 'the archive has no such conversation')
+  const conversation = parseConversation(readZipEntry(buffer, entry), entryName)
+  const turns = conversationTurns(selectBranch(conversation))
+  if (turns.length === 0) throw new SlimError('empty-conversation', 'the conversation has no USER turn')
+  const keep = Math.max(1, Math.min(keepTurns, turns.length))
+  const dropped = turns.slice(0, turns.length - keep)
+  const chunks = chunkTurns(dropped)
+  const chars = dropped.reduce((sum, turn) => sum + turn.chars, 0)
+  const plan = { turns, kept: turns.length - dropped.length, dropped, chunks, chars, tokens: estimateTokensOf(chars) }
+  planCache = { key: cacheKey, buffer, plan }
+  return plan
+}
+
+/** One-entry plan cache, keyed by entry name, keep count, and archive identity. */
+let planCache
+
+/**
+ * Route handler: `POST /dsh-session-slim/amplify/plan`.
+ * @param ctx - Host context.
+ * @returns the Node request handler.
+ */
+export function amplifyPlanHandler(ctx) {
+  return async (request, response) => {
+    if (request.method !== 'POST') {
+      response.writeHead(405, { allow: 'POST' })
+      response.end()
+      return
+    }
+    if (!sameOrigin(request)) {
+      sendJson(response, 403, { ok: false, code: 'origin' })
+      return
+    }
+    const pending = requirePending(response)
+    if (pending === undefined) return
+    const params = await readJsonBody(request, response)
+    if (params === undefined) return
+    const conversationId = isRecord(params) ? params.conversationId : undefined
+    const keepTurns = isRecord(params) ? params.keepTurns : undefined
+    if (typeof conversationId !== 'string' || conversationId === '') {
+      sendJson(response, 400, { ok: false, code: 'bad-request', error: 'conversationId must be a non-empty string' })
+      return
+    }
+    if (typeof keepTurns !== 'number' || !Number.isSafeInteger(keepTurns) || keepTurns < 1) {
+      sendJson(response, 400, { ok: false, code: 'bad-request', error: 'keepTurns must be a positive integer' })
+      return
+    }
+    try {
+      const plan = planAmplify(pending.buffer, conversationEntryName(conversationId), keepTurns)
+      sendJson(response, 200, {
+        ok: true,
+        removedTurns: plan.dropped.length,
+        keptTurns: plan.kept,
+        chars: plan.chars,
+        tokens: plan.tokens,
+        segments: plan.chunks.map((chunk) => ({
+          index: chunk.index, turns: chunk.turns, chars: chunk.chars, tokens: chunk.tokens,
+        })),
+      })
+    }
+    catch (error) {
+      if (error instanceof SlimError) {
+        sendJson(response, 400, { ok: false, code: error.code, error: error.message })
+        return
+      }
+      warn(ctx, 'amplify plan failed', error)
+      sendJson(response, 500, { ok: false, code: 'build-failed', error: String(error?.message ?? error) })
+    }
+  }
+}
+
+/**
+ * Route handler: `POST /dsh-session-slim/amplify/start`.
+ * @param ctx - Host context.
+ * @param runner - the amplify runner.
+ * @returns the Node request handler.
+ */
+export function amplifyStartHandler(ctx, runner) {
+  return async (request, response) => {
+    if (request.method !== 'POST') {
+      response.writeHead(405, { allow: 'POST' })
+      response.end()
+      return
+    }
+    if (!sameOrigin(request)) {
+      sendJson(response, 403, { ok: false, code: 'origin' })
+      return
+    }
+    const pending = requirePending(response)
+    if (pending === undefined) return
+    const params = await readJsonBody(request, response)
+    if (params === undefined) return
+    const conversationId = isRecord(params) ? params.conversationId : undefined
+    const keepTurns = isRecord(params) ? params.keepTurns : undefined
+    const workspaceId = isRecord(params) ? params.workspaceId : undefined
+    const locale = isRecord(params) ? params.locale : undefined
+    const model = isRecord(params) ? params.model : undefined
+    if (typeof workspaceId !== 'string' || workspaceId === '') {
+      sendJson(response, 400, { ok: false, code: 'bad-request', error: 'workspaceId must be a non-empty string' })
+      return
+    }
+    // Same validation the plan route applies: without it a missing or bogus keepTurns
+    // produces NaN, empty chunks, and a summary session that occupies the slot for nothing.
+    if (typeof conversationId !== 'string' || !SAFE_CONVERSATION_ID.test(conversationId)) {
+      sendJson(response, 400, { ok: false, code: 'bad-request', error: 'conversationId must be a plain conversation id' })
+      return
+    }
+    if (typeof keepTurns !== 'number' || !Number.isFinite(keepTurns)) {
+      sendJson(response, 400, { ok: false, code: 'bad-request', error: 'keepTurns must be a number' })
+      return
+    }
+    let plan
+    try {
+      plan = planAmplify(pending.buffer, conversationEntryName(conversationId), keepTurns)
+    }
+    catch (error) {
+      sendJson(response, 400, {
+        ok: false,
+        code: error instanceof SlimError ? error.code : 'build-failed',
+        error: String(error?.message ?? error),
+      })
+      return
+    }
+    if (!Array.isArray(plan.chunks) || plan.chunks.length === 0) {
+      sendJson(response, 400, { ok: false, code: 'nothing-to-summarize', error: 'no turn would be removed, so there is nothing to summarize' })
+      return
+    }
+    try {
+      const started = runner.start({
+        workspaceId, locale, model, removedTurns: plan.dropped.length, chunks: plan.chunks,
+      })
+      sendJson(response, 200, { ok: true, ...started })
+    }
+    catch (error) {
+      const code = String(error?.message ?? error)
+      const status = code === 'amplify-busy' ? 409 : code === 'amplify-write-failed' || code === 'amplify-no-workspace' ? 400 : 501
+      sendJson(response, status, { ok: false, code, error: code })
+    }
+  }
+}
+
+/**
+ * Route handler: `POST /dsh-session-slim/amplify/status`.
+ * @param runner - the amplify runner.
+ * @returns the Node request handler.
+ */
+export function amplifyStatusHandler(runner) {
+  return async (request, response) => {
+    if (request.method !== 'POST') {
+      response.writeHead(405, { allow: 'POST' })
+      response.end()
+      return
+    }
+    if (!sameOrigin(request)) {
+      sendJson(response, 403, { ok: false, code: 'origin' })
+      return
+    }
+    sendJson(response, 200, { ok: true, ...runner.status() })
+  }
+}
+
+/**
+ * Route handler: `POST /dsh-session-slim/amplify/decide` — answer a parked run.
+ * @param runner - the amplify runner.
+ * @returns the Node request handler.
+ */
+export function amplifyDecideHandler(runner) {
+  return async (request, response) => {
+    if (request.method !== 'POST') {
+      response.writeHead(405, { allow: 'POST' })
+      response.end()
+      return
+    }
+    if (!sameOrigin(request)) {
+      sendJson(response, 403, { ok: false, code: 'origin' })
+      return
+    }
+    const params = await readJsonBody(request, response)
+    if (params === undefined) return
+    const decision = isRecord(params) ? params.decision : undefined
+    if (decision !== 'continue' && decision !== 'cancel' && decision !== 'without') {
+      sendJson(response, 400, { ok: false, code: 'bad-request', error: 'decision must be continue, cancel, or without' })
+      return
+    }
+    sendJson(response, 200, { ok: true, ...runner.decide(decision) })
+  }
+}
+
+/**
+ * Route handler: `POST /dsh-session-slim/amplify/cancel`.
+ * @param runner - the amplify runner.
+ * @returns the Node request handler.
+ */
+export function amplifyCancelHandler(runner) {
+  return async (request, response) => {
+    if (request.method !== 'POST') {
+      response.writeHead(405, { allow: 'POST' })
+      response.end()
+      return
+    }
+    if (!sameOrigin(request)) {
+      sendJson(response, 403, { ok: false, code: 'origin' })
+      return
+    }
+    sendJson(response, 200, { ok: true, ...runner.cancel() })
+  }
+}
+
+/**
+ * Workspace-scoped scratch files for one amplify run.
+ * The chunks go inside the workspace so the summary agent can read them with its own
+ * tools; the directory is removed as soon as the run settles.
+ */
+const amplifyFiles = {
+  /**
+   * Write the chunk files and report where they landed.
+   * @param workspacePath - absolute path of the chosen workspace.
+   * @param chunks - chunk payloads from `chunkTurns`.
+   * @returns `{ dirAbsolute, dirRelative }`.
+   */
+  write(workspacePath, chunks) {
+    const name = `summary-${Date.now().toString(36)}`
+    const dirAbsolute = join(workspacePath, '.dsh-slim', name)
+    mkdirSync(dirAbsolute, { recursive: true })
+    try {
+      for (const chunk of chunks) {
+        const file = `part-${String(chunk.index + 1).padStart(2, '0')}.md`
+        writeFileSync(join(dirAbsolute, file), chunk.text, 'utf8')
+      }
+    }
+    catch (error) {
+      // A half-written directory holds the dropped turns, so it must not survive the
+      // failure: nothing references it yet, so clean it up right here.
+      try {
+        rmSync(dirAbsolute, { recursive: true, force: true })
+      }
+      catch {
+        /* best effort */
+      }
+      throw error
+    }
+    return { dirAbsolute, dirRelative: `.dsh-slim/${name}` }
+  },
+  /**
+   * Read the note the agent was asked to write.
+   * @param dirAbsolute - the scratch directory.
+   * @returns the note, or undefined when the agent did not write one.
+   */
+  read(dirAbsolute) {
+    try {
+      return readFileSync(join(dirAbsolute, 'SUMMARY.md'), 'utf8')
+    }
+    catch {
+      return undefined
+    }
+  },
+  /**
+   * Append one line to the run log, which survives cleanup for diagnosis.
+   * @param workspacePath - absolute path of the workspace.
+   * @param line - the text to append.
+   */
+  trace(workspacePath, line) {
+    if (typeof workspacePath !== 'string' || workspacePath === '') return
+    try {
+      const dir = join(workspacePath, '.dsh-slim')
+      mkdirSync(dir, { recursive: true })
+      const file = join(dir, 'last-run.log')
+      const stat = existsSync(file) ? statSync(file) : undefined
+      // keep it small: start over once it passes 256 KiB
+      if (stat !== undefined && stat.size > 262144) rmSync(file, { force: true })
+      writeFileSync(file, line + '\n', { flag: 'a' })
+    }
+    catch {
+      /* diagnostics are best effort */
+    }
+  },
+  /**
+   * Delete the scratch directory.
+   * @param dirAbsolute - the scratch directory.
+   */
+  cleanup(dirAbsolute) {
+    try {
+      rmSync(dirAbsolute, { recursive: true, force: true })
+    }
+    catch {
+      /* leaving a scratch directory behind is harmless */
+    }
+  },
+}
+
 /**
  * Register the routes on the harness web server, which may be acquired later.
  * @param ctx - Host context.
  */
 export function apply(ctx) {
+  const runner = createAmplifyRunner({
+    getController: () => ctx.get('sessionController'),
+    getWorkspacePath: (workspaceId) => {
+      const registry = ctx.get('workspaceRegistry')
+      if (registry === undefined || typeof registry.get !== 'function') return undefined
+      const workspace = registry.get(workspaceId)
+      if (workspace === undefined || workspace === null) return undefined
+      return typeof workspace.path === 'string' ? workspace.path : undefined
+    },
+    files: amplifyFiles,
+    warn: (message, error) => { warn(ctx, message, error) },
+  })
   ctx.inject(['webServer'], (host) => {
     host.effect(() => {
       const disposers = [
         host.webServer.register({ kind: 'exact', path: PREVIEW_ROUTE, handler: previewHandler(ctx) }),
-        host.webServer.register({ kind: 'exact', path: BUILD_ROUTE, handler: buildHandler(ctx) }),
+        host.webServer.register({ kind: 'exact', path: BUILD_ROUTE, handler: buildHandler(ctx, runner) }),
         host.webServer.register({ kind: 'exact', path: SCAN_ROUTE, handler: scanHandler(ctx) }),
         host.webServer.register({ kind: 'exact', path: OPEN_ROUTE, handler: openHandler(ctx) }),
+        host.webServer.register({ kind: 'exact', path: AMPLIFY_PLAN_ROUTE, handler: amplifyPlanHandler(ctx) }),
+        host.webServer.register({ kind: 'exact', path: AMPLIFY_START_ROUTE, handler: amplifyStartHandler(ctx, runner) }),
+        host.webServer.register({ kind: 'exact', path: AMPLIFY_STATUS_ROUTE, handler: amplifyStatusHandler(runner) }),
+        host.webServer.register({ kind: 'exact', path: AMPLIFY_CANCEL_ROUTE, handler: amplifyCancelHandler(runner) }),
+        host.webServer.register({ kind: 'exact', path: AMPLIFY_DECIDE_ROUTE, handler: amplifyDecideHandler(runner) }),
       ]
       return () => {
+        runner.dispose()
         clearPending()
         clearScan()
         for (const dispose of disposers) dispose()
