@@ -419,6 +419,8 @@ export function createAmplifyRunner(options) {
       model: config.model,
       workspaceId: config.workspaceId,
       workspacePath,
+      title: config.title,
+      dropped: Array.isArray(config.dropped) ? config.dropped : [],
       removedTurns: config.removedTurns,
       chunks,
       dir: written.dirAbsolute,
@@ -508,6 +510,36 @@ export function createAmplifyRunner(options) {
       current.error = 'the summary session wrote no SUMMARY.md and returned no text'
       cleanup(current)
       return
+    }
+    // Archive the dropped turns beside the summary so the revived session can look up the
+    // original wording later. Local file writes only: this adds no model tokens.
+    if (typeof files.writeHistory === 'function') {
+      try {
+        const archived = files.writeHistory(current.workspacePath, {
+          title: current.title ?? '',
+          turns: current.dropped,
+          locale: current.locale,
+        })
+        if (archived !== undefined && typeof archived.indexRelative === 'string') {
+          // Point at the directory, not the index: searching the directory is the reliable
+          // way to find one topic among dozens of pages; the index is only an overview.
+          const where = typeof archived.dirRelative === 'string' ? archived.dirRelative : archived.indexRelative
+          current.summary = [
+            current.summary,
+            '',
+            '---',
+            `完整原文存档：${where}/（已按片切分）`,
+            '要找具体内容时先在这个目录搜索关键词，命中哪个 part-NN.md 再读那一片；索引.md 只用来看整体结构。',
+          ].join('\n')
+          current.diagnostics.push({ step: 'archive', pages: archived.pages })
+          trace(current, `history archived pages=${archived.pages}`)
+        }
+      }
+      catch (error) {
+        // An archive failure must not discard a summary that already cost money.
+        warn('amplify archive failed', error)
+        current.diagnostics.push({ step: 'archive', error: String(error?.message ?? error) })
+      }
     }
     current.state = 'done'
     cleanup(current)

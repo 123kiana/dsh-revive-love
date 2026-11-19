@@ -34,6 +34,7 @@ import { homedir } from 'node:os'
 import { basename, join, resolve } from 'node:path'
 import { inflateRawSync } from 'node:zlib'
 import { chunkTurns, createAmplifyRunner, estimateTokensOf } from './amplify.js'
+import { installSummaryPrompt } from './summary-prompt.js'
 
 /** The plugin's own identity, echoed by the patch row and the client bundle. */
 export const name = 'session-slim'
@@ -1307,7 +1308,15 @@ export function planAmplify(buffer, entryName, keepTurns) {
   const dropped = turns.slice(0, turns.length - keep)
   const chunks = chunkTurns(dropped)
   const chars = dropped.reduce((sum, turn) => sum + turn.chars, 0)
-  const plan = { turns, kept: turns.length - dropped.length, dropped, chunks, chars, tokens: estimateTokensOf(chars) }
+  const plan = {
+    turns,
+    kept: turns.length - dropped.length,
+    dropped,
+    chunks,
+    chars,
+    tokens: estimateTokensOf(chars),
+    title: conversation.title,
+  }
   planCache = { key: cacheKey, buffer, plan }
   return plan
 }
@@ -1427,7 +1436,13 @@ export function amplifyStartHandler(ctx, runner) {
     }
     try {
       const started = runner.start({
-        workspaceId, locale, model, removedTurns: plan.dropped.length, chunks: plan.chunks,
+        workspaceId,
+        locale,
+        model,
+        title: plan.title,
+        dropped: plan.dropped,
+        removedTurns: plan.dropped.length,
+        chunks: plan.chunks,
       })
       sendJson(response, 200, { ok: true, ...started })
     }
@@ -1506,12 +1521,128 @@ export function amplifyCancelHandler(runner) {
   }
 }
 
+/** Directory (inside the workspace) that keeps the archived original turns. */
+const HISTORY_DIR = '.dsh-revive'
+/** Index file name inside `HISTORY_DIR`. */
+const HISTORY_INDEX = '索引.md'
+/** Largest character count one archive page may carry. */
+const HISTORY_PAGE_CHARS = 8000
+
+/**
+ * Render one dropped turn for the archive.
+ * @param index - 1-based turn number within the dropped range.
+ * @param turn - `{ userText, replyText }`.
+ * @param locale - `zh` or `en`.
+ * @returns the markdown block.
+ */
+function renderHistoryTurn(index, turn, locale) {
+  const userLabel = locale === 'en' ? 'User' : '用户'
+  const replyLabel = locale === 'en' ? 'Assistant' : '助手'
+  const heading = locale === 'en' ? `### Turn ${index}` : `### 第 ${index} 轮`
+  const parts = [heading]
+  const user = typeof turn?.userText === 'string' ? turn.userText.trim() : ''
+  const reply = typeof turn?.replyText === 'string' ? turn.replyText.trim() : ''
+  if (user !== '') parts.push(`**${userLabel}**：${user}`)
+  if (reply !== '') parts.push(`**${replyLabel}**：${reply}`)
+  return parts.join('\n\n')
+}
+
+/**
+ * A one-line hint for an index row: the two longest user texts on that page.
+ * One first sentence rarely says what a page is about; two of the longest usually do.
+ */
+function historyHint(page) {
+  const texts = page
+    .map(item => String(item.turnText ?? '').replace(/\s+/g, ' ').trim())
+    .filter(text => text !== '')
+    .sort((left, right) => right.length - left.length)
+    .slice(0, 2)
+  if (texts.length === 0) return ''
+  return texts.map(text => `「${text.slice(0, 20)}${text.length > 20 ? '…' : ''}」`).join(' ')
+}
+
 /**
  * Workspace-scoped scratch files for one amplify run.
  * The chunks go inside the workspace so the summary agent can read them with its own
  * tools; the directory is removed as soon as the run settles.
  */
-const amplifyFiles = {
+/**
+ * Write the paged archive files and the index into an already-created directory.
+ * @param dirAbsolute - absolute path of the `history-<id>` directory.
+ * @param name - that directory's name, used to build the relative paths.
+ * @param title - original conversation title, recorded in the index header.
+ * @param turns - dropped turns, oldest first.
+ * @param locale - `zh` or `en`.
+ * @returns `{ indexRelative, dirRelative, pages }`.
+ */
+function writeHistoryPages(dirAbsolute, name, title, turns, locale) {
+  const pages = []
+  let current = []
+  let chars = 0
+  for (let i = 0; i < turns.length; i += 1) {
+    const block = renderHistoryTurn(i + 1, turns[i], locale)
+    if (current.length > 0 && chars + block.length > HISTORY_PAGE_CHARS) {
+      pages.push(current)
+      current = []
+      chars = 0
+    }
+    current.push({ turn: i + 1, block, turnText: String(turns[i]?.userText ?? '') })
+    chars += block.length
+  }
+  if (current.length > 0) pages.push(current)
+
+  const pagePreamble = locale === 'en'
+    ? '> These are the words of your own earlier conversation with this person.\n> Recall them; do not look them up like an external archive.\n\n'
+    : '> 这是你和这个人过去的对话原话，是你自己的记忆，不是外部资料库。\n> 回忆它，别当成查别人的档案。\n\n'
+
+  const indexLines = []
+  pages.forEach((page, index) => {
+    const fileName = `part-${String(index + 1).padStart(2, '0')}.md`
+    const pageChars = page.reduce((sum, item) => sum + item.block.length, 0)
+    const body = `${pagePreamble}${page.map(item => item.block).join('\n\n')}\n`
+    writeFileSync(join(dirAbsolute, fileName), body, 'utf8')
+    const first = page[0].turn
+    const last = page[page.length - 1].turn
+    // A single turn longer than the page budget gets a page of its own; flag it so a
+    // reader knows that page costs more than the usual few thousand tokens.
+    const oversized = pageChars > HISTORY_PAGE_CHARS ? `  ⚠ 超长 ${pageChars} 字符` : ''
+    indexLines.push(`- ${fileName}  轮次 ${first}–${last}  ${historyHint(page)}${oversized}`)
+  })
+
+  const header = locale === 'en'
+    ? [
+      '# Our earlier conversation (archive)',
+      `Title: ${title}`,
+      `Dropped turns: ${turns.length}, split into ${pages.length} page(s)`,
+      '',
+      'These are the actual words from your own earlier conversation with this person.',
+      'They are your memory, not an external database: recall them, do not look them up.',
+      '',
+      'To find one topic, search this directory for a keyword first;',
+      'read part-NN.md only for the page a search points at. Read this index for the overview.',
+      '',
+    ]
+    : [
+      '# 我们之前的对话（存档）',
+      `会话：${title}`,
+      `被删轮次：${turns.length} 轮，分为 ${pages.length} 片`,
+      '',
+      '下面是你们过去的对话原话。这是你自己的记忆，不是外部资料库 ——',
+      '回忆它，别当成查别人的档案。',
+      '',
+      '要找某件具体的事，先在这个目录里搜索关键词，命中哪个 part-NN.md 再读那一片；',
+      '这张索引只用来先看整体结构。',
+      '',
+    ]
+  writeFileSync(join(dirAbsolute, HISTORY_INDEX), `${[...header, ...indexLines].join('\n')}\n`, 'utf8')
+  return {
+    indexRelative: `${HISTORY_DIR}/${name}/${HISTORY_INDEX}`,
+    dirRelative: `${HISTORY_DIR}/${name}`,
+    pages: pages.length,
+  }
+}
+
+export const amplifyFiles = {
   /**
    * Write the chunk files and report where they landed.
    * @param workspacePath - absolute path of the chosen workspace.
@@ -1540,6 +1671,38 @@ const amplifyFiles = {
       throw error
     }
     return { dirAbsolute, dirRelative: `.dsh-slim/${name}` }
+  },
+  /**
+   * Archive the dropped turns as paged files plus an index.
+   *
+   * The index costs a couple of KB and one page a few thousand tokens, so a revived
+   * session can look up the original wording on demand instead of carrying the whole
+   * archive in its context. Nothing here calls a model.
+   * @param workspacePath - absolute path of the workspace.
+   * @param options - `{ title, turns, locale }`.
+   * @returns `{ indexRelative, pages }`, or undefined when there is nothing to archive.
+   */
+  writeHistory(workspacePath, options) {
+    const { title, turns, locale } = options
+    if (typeof workspacePath !== 'string' || workspacePath === '') return undefined
+    if (!Array.isArray(turns) || turns.length === 0) return undefined
+    const name = `history-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`
+    const dirAbsolute = join(workspacePath, HISTORY_DIR, name)
+    mkdirSync(dirAbsolute, { recursive: true })
+    try {
+      return writeHistoryPages(dirAbsolute, name, title, turns, locale)
+    }
+    catch (error) {
+      // A partial archive with no index is worse than none: a reader would see pages and
+      // no map. Nothing references this directory yet, so remove it here.
+      try {
+        rmSync(dirAbsolute, { recursive: true, force: true })
+      }
+      catch {
+        /* best effort */
+      }
+      throw error
+    }
   },
   /**
    * Read the note the agent was asked to write.
@@ -1593,6 +1756,12 @@ const amplifyFiles = {
  * @param ctx - Host context.
  */
 export function apply(ctx) {
+  // Amplified sessions get their summary as a scoped system-prompt section, so the model
+  // reads it as background instead of as a fresh user message. See summary-prompt.js.
+  installSummaryPrompt(ctx, {
+    headers: [NOTICES.zh.summaryHeader, NOTICES.en.summaryHeader],
+    warn: (message, error) => { warn(ctx, message, error) },
+  })
   const runner = createAmplifyRunner({
     getController: () => ctx.get('sessionController'),
     getWorkspacePath: (workspaceId) => {
