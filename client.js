@@ -103,8 +103,7 @@ window.__ModuleLoader__.load({
       'amplify.workspace': '会在「{name}」新建 1 条总结会话，保留不自动删除',
       'amplify.model': '模型：flash、思考关闭',
       'amplify.segments': '会写成 {count} 个文件，交给一条总结会话读完并压缩',
-      'amplify.tokens': '预计可能超过 {tokens} token',
-      'amplify.cache': '摘要任务基本没有缓存可用，缓存命中率低，实际花费相较于日常使用更高',
+      'amplify.cost': '会把整段对话一次性读进上下文，消耗的 token 远高于日常对话；这项任务几乎没有缓存可用',
       'amplify.failure': '需要等待，期间可能失败或超时；失败时可以选择不带摘要继续',
       'amplify.confirm': '我已了解，开启',
       'amplify.planning': '正在计算分段…',
@@ -126,6 +125,7 @@ window.__ModuleLoader__.load({
       'result.name': '新会话标题：{title}',
       'result.turns': '保留 {kept} 轮（丢弃 {removed} 轮）',
       'result.tokens': '估算约 {tokens} token',
+      'result.partial': '这次摘要只读到原文的 {percent}%（较早的部分没进摘要）。原文已存档，需要时让模型用 history_search 去查，别当作没发生过。',
       'result.imported': '已直接导入到工作区，共 {count} 个新会话。',
       'result.downloaded': '已下载 {name}。请用侧边栏的「导入 DeepSeek 会话」按钮导入它。',
       'result.downloadedNoPlugin': '已下载 {name}，但没有找到官方导入插件；请先安装「导入 DeepSeek 会话」再导入这个文件。',
@@ -203,8 +203,7 @@ window.__ModuleLoader__.load({
       'amplify.workspace': 'Creates 1 summary conversation in "{name}" and keeps it',
       'amplify.model': 'Model: flash, reasoning off',
       'amplify.segments': 'Writes {count} file(s) for one summary session to read and condense',
-      'amplify.tokens': 'Expected to exceed {tokens} tokens',
-      'amplify.cache': 'Summary work has essentially no cache reuse, so it costs more than everyday chatting',
+      'amplify.cost': 'Reads the whole history into one context at once, so it burns far more tokens than everyday chatting, with almost no cache reuse',
       'amplify.failure': 'It takes a while and may fail or stall; if it does you can continue without the summary',
       'amplify.confirm': 'I understand, turn it on',
       'amplify.planning': 'Working out the segments…',
@@ -226,6 +225,7 @@ window.__ModuleLoader__.load({
       'result.name': 'New conversation title: {title}',
       'result.turns': 'Kept {kept} turns (dropped {removed})',
       'result.tokens': 'about {tokens} tokens',
+      'result.partial': 'This summary covered only {percent}% of the source; the earlier part is missing. The full text is archived — have the model search it with history_search instead of assuming it never happened.',
       'result.imported': 'Imported directly into the workspace: {count} new sessions.',
       'result.downloaded': 'Downloaded {name}. Import it with the sidebar’s “Import DeepSeek chats” action.',
       'result.downloadedNoPlugin': 'Downloaded {name}, but the official import plugin is not installed; install “Import DeepSeek chats” first.',
@@ -549,6 +549,8 @@ window.__ModuleLoader__.load({
       const [amplifyPhase, setAmplifyPhase] = useState('idle')
       const [amplifyProgress, setAmplifyProgress] = useState({ count: 0 })
       const [amplifySummary, setAmplifySummary] = useState(null)
+      /** Set when the summary run read only part of its own chunks. */
+      const [amplifyCoverage, setAmplifyCoverage] = useState(null)
       const [amplifyError, setAmplifyError] = useState(null)
       const [amplifyStall, setAmplifyStall] = useState(null)
       /** Minimized while running, so the rest of DSH stays usable. */
@@ -832,6 +834,7 @@ window.__ModuleLoader__.load({
           }
           if (status.state === 'done' && typeof status.summary === 'string') {
             setAmplifySummary(status.summary)
+            setAmplifyCoverage(status.coverage ?? null)
             setAmplifyPhase('done')
             return
           }
@@ -839,6 +842,7 @@ window.__ModuleLoader__.load({
             setAmplifyPhase(status.state === 'abandoned' ? 'cancelled' : status.state)
             setAmplifyOn(false)
             setAmplifySummary(null)
+            setAmplifyCoverage(null)
             return
           }
         }
@@ -851,6 +855,7 @@ window.__ModuleLoader__.load({
         setAmplifyPhase('running')
         // A summary left over from an earlier run must never be folded into this one.
         setAmplifySummary(null)
+        setAmplifyCoverage(null)
         // Every new run starts centred again, even if the panel was dragged last time.
         setFloatPos(null)
         setAmplifyMin(true)
@@ -937,6 +942,7 @@ window.__ModuleLoader__.load({
         }
         setAmplifyPhase('cancelled')
         setAmplifySummary(null)
+        setAmplifyCoverage(null)
         setAmplifyStall(null)
       }, [])
 
@@ -957,6 +963,7 @@ window.__ModuleLoader__.load({
         else {
           setAmplifyPhase('cancelled')
           setAmplifySummary(null)
+          setAmplifyCoverage(null)
           setAmplifyOn(false)
         }
       }, [])
@@ -1286,6 +1293,7 @@ window.__ModuleLoader__.load({
                     const next = !amplifyOn
                     setAmplifyOn(next)
                     setAmplifySummary(null)
+                    setAmplifyCoverage(null)
                     if (next) void openAmplify()
                     else setAmplifyPhase('idle')
                   },
@@ -1357,6 +1365,9 @@ window.__ModuleLoader__.load({
           h('p', { className: 'dsh-slim-summary-line' }, t('result.tokens', {
             tokens: formatTokens(result === null ? 0 : result.estTokens),
           })),
+          amplifyCoverage === null ? null : h('p', { className: 'dsh-slim-warn' }, t('result.partial', {
+            percent: String(Math.floor((amplifyCoverage.ratio ?? 0) * 100)),
+          })),
           h('p', { className: 'dsh-slim-note' }, mode === 'imported'
             ? t('result.imported', { count: String(result !== null && result.sessionIds !== undefined ? result.sessionIds.length : 0) })
             : t(result !== null && result.hasPlugin === false ? 'result.downloadedNoPlugin' : 'result.downloaded', {
@@ -1399,8 +1410,7 @@ window.__ModuleLoader__.load({
                 h('li', null, t('amplify.workspace', { name: workspaceNameOf(chosenWorkspaceId) })),
                 h('li', null, t('amplify.model')),
                 h('li', null, t('amplify.segments', { count: String(amplifyPlan.segments.length) })),
-                h('li', null, t('amplify.tokens', { tokens: formatTokens(amplifyPlan.tokens) })),
-                h('li', null, t('amplify.cache')),
+                h('li', null, t('amplify.cost')),
                 h('li', null, t('amplify.failure')),
               ),
             ),

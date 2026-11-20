@@ -227,6 +227,32 @@ export function recordsSample(output) {
 }
 
 /**
+ * Total provider-reported usage across every assistant step of a session.
+ *
+ * `scanUsage` below answers "how big did one step get", which is what the stall guard
+ * wants. The floating panel wants the running bill, and that is this sum: reading a file
+ * re-sends everything read before it, so the last step's size is nowhere near the total.
+ * @param events - `session.snapshotEvents()`.
+ * @returns the summed `totalTokens`, or 0 when no step reported usage.
+ */
+export function totalUsageOf(events) {
+  if (!Array.isArray(events)) return 0
+  let total = 0
+  for (const event of events) {
+    if (event?.type !== 'assistant/message') continue
+    const usage = event.data?.usage
+    if (usage === undefined || usage === null || typeof usage !== 'object') continue
+    const reported = Number(usage.totalTokens)
+    if (Number.isFinite(reported)) {
+      total += reported
+      continue
+    }
+    total += (Number(usage.inputTokens) || 0) + (Number(usage.cacheReadTokens) || 0) + (Number(usage.outputTokens) || 0)
+  }
+  return total
+}
+
+/**
  * Sum provider-reported token usage found anywhere in a state snapshot.
  * @param snapshot - whatever `controller.wait()` returned.
  * @returns the largest total found, in tokens, or 0.
@@ -263,14 +289,104 @@ function requestIdOf(sessionId) {
   return `${sessionId}-amplify`
 }
 
+/** Chunk file names, as written by `files.write`. */
+const PART_FILE = /part-\d+\.md$/
+
+/** Coverage at or above this counts as complete; a line-count off-by-one must not alarm. */
+const COVERAGE_ENOUGH = 0.99
+
+/**
+ * How much of the chunk files the summary session actually read.
+ *
+ * The prompt asks it to read everything, but `read` returns roughly a thousand lines per
+ * call and a 400,000-character chunk is nearly twenty thousand lines, so a long run can end
+ * with the model having read part of each file and summarised anyway. The session's own
+ * `tool/result` events carry `meta.offset`, the returned line count and `meta.totalLines`,
+ * so the real coverage can be measured instead of trusted.
+ * @param session - the summary session, from `sessions.get(id)`.
+ * @returns `{ ratio, parts }`, or undefined when nothing measurable was read.
+ */
+export function readCoverageOf(session) {
+  let events
+  try {
+    if (typeof session?.snapshotEvents === 'function') events = session.snapshotEvents()
+    else if (Array.isArray(session?.events)) events = session.events
+  }
+  catch {
+    return undefined
+  }
+  if (!Array.isArray(events)) return undefined
+  const per = new Map()
+  for (const event of events) {
+    if (event?.type !== 'tool/result') continue
+    const meta = event.data?.meta
+    if (meta === undefined || typeof meta.path !== 'string') continue
+    const name = meta.path.replace(/\\/gu, '/').split('/').pop()
+    if (name === undefined || !PART_FILE.test(name)) continue
+    const total = Number(meta.totalLines)
+    if (!Number.isFinite(total) || total <= 0) continue
+    const count = Array.isArray(meta.lines) ? meta.lines.length : 0
+    if (count === 0) continue
+    const start = Number.isFinite(Number(meta.offset)) ? Math.max(1, Number(meta.offset)) : 1
+    // Clamp: a slice may overshoot the last line by one, and that is not extra coverage.
+    const end = Math.min(total, start + count - 1)
+    const previous = per.get(name)
+    per.set(name, { total, end: Math.max(previous?.end ?? 0, end) })
+  }
+  if (per.size === 0) return undefined
+  let covered = 0
+  let lines = 0
+  const parts = []
+  for (const [name, item] of per) {
+    covered += item.end
+    lines += item.total
+    parts.push({ name, ratio: item.end / item.total })
+  }
+  return { ratio: lines === 0 ? 0 : covered / lines, parts }
+}
+
+/**
+ * Tell the reader that the summary is incomplete, in a way the revived model cannot miss.
+ * Silently covering two thirds of the history is worse than saying so: the model would
+ * treat "not in the summary" as "never happened".
+ * @param coverage - the result of {@link readCoverageOf}.
+ * @param locale - `zh` or `en`.
+ * @returns the note to append to the summary.
+ */
+export function coverageNote(coverage, locale) {
+  const percent = Math.floor(coverage.ratio * 100)
+  const detail = coverage.parts
+    .filter(part => part.ratio < COVERAGE_ENOUGH)
+    .map(part => (locale === 'en'
+      ? `${part.name.replace(/\.md$/u, '')} ${Math.floor(part.ratio * 100)}%`
+      : `${part.name.replace(/\.md$/u, '')} 读到 ${Math.floor(part.ratio * 100)}%`))
+    .join(locale === 'en' ? ', ' : '、')
+  if (locale === 'en') {
+    return [
+      '---',
+      `【Coverage】This summary read only ${percent}% of the archive${detail === '' ? '' : ` (${detail})`}.`,
+      'The unread part is the earlier part of the conversation. It is not in the summary above,',
+      'but it did happen: use history_search on the archive when it matters, and never assume',
+      '"not in the summary" means "never happened".',
+    ].join('\n')
+  }
+  return [
+    '---',
+    `【覆盖说明】这份摘要只读到存档的 ${percent}%${detail === '' ? '' : `（${detail}）`}。`,
+    '没读到的是较早的那部分。那些内容不在上面的摘要里，但它们发生过 ——',
+    '需要时用 history_search 查存档，不要因为摘要里没有就当它没发生过。',
+  ].join('\n')
+}
+
 /**
  * Create a runner bound to one host context.
- * @param options - `{ getController, getWorkspacePath, files, warn }`, where `files`
- *   supplies `{ write(chunks), read(dir), cleanup(dir) }` over the workspace.
+ * @param options - `{ getController, getSession, getWorkspacePath, files, warn }`, where
+ *   `files` supplies `{ write(chunks), read(dir), cleanup(dir) }` over the workspace and
+ *   `getSession(id)` returns a live Session so the run can audit its own coverage.
  * @returns `{ start, status, cancel, isActive, dispose }` over a single run slot.
  */
 export function createAmplifyRunner(options) {
-  const { getController, getWorkspacePath, files, warn } = options
+  const { getController, getSession, getWorkspacePath, files, warn } = options
   let job
 
   /** Whether a run currently holds the slot. */
@@ -288,11 +404,37 @@ export function createAmplifyRunner(options) {
       summary: job.summary,
       error: job.error,
       elapsedMs: Date.now() - job.startedAt,
-      tokens: job.tokens || 0,
+      tokens: measuredTokens(job),
       expectedTokens: job.tokensExpected || 0,
       chunkCount: job.chunks.length,
       stallReason: job.stallReason,
+      // Present only when the run finished with an incomplete read of its own chunks.
+      coverage: job.coverage === undefined
+        ? undefined
+        : { ratio: job.coverage.ratio, parts: job.coverage.parts },
       diagnostics: job.diagnostics.slice(-20),
+    }
+  }
+
+  /**
+   * The running bill for the browser panel: summed step usage from the session's own
+   * events. Falls back to the per-step maximum when the session cannot be read. Cached by
+   * the last event sequence, because `status()` is polled and `snapshotEvents()` copies.
+   */
+  function measuredTokens(current) {
+    if (typeof getSession !== 'function' || typeof current.sessionId !== 'string') return current.tokens || 0
+    try {
+      const session = getSession(current.sessionId)
+      const events = typeof session?.snapshotEvents === 'function' ? session.snapshotEvents() : undefined
+      if (!Array.isArray(events) || events.length === 0) return current.tokens || 0
+      const seq = events[events.length - 1]?.seq
+      if (current.tokenCache !== undefined && current.tokenCache.seq === seq) return current.tokenCache.total
+      const total = totalUsageOf(events)
+      current.tokenCache = { seq, total }
+      return total > 0 ? total : (current.tokens || 0)
+    }
+    catch {
+      return current.tokens || 0
     }
   }
 
@@ -432,6 +574,8 @@ export function createAmplifyRunner(options) {
       cancelled: false,
       tokens: 0,
       tokensExpected: chunks.reduce((sum, chunk) => sum + chunk.tokens, 0),
+      coverage: undefined,
+      tokenCache: undefined,
       resume: undefined,
     }
     void run(controller, job)
@@ -511,6 +655,9 @@ export function createAmplifyRunner(options) {
       cleanup(current)
       return
     }
+    // Measure what the session actually read before it called itself done. This has to
+    // happen before cleanup: the events live on the session, not on the scratch files.
+    const coverage = measureCoverage(current)
     // Archive the dropped turns beside the summary so the revived session can look up the
     // original wording later. Local file writes only: this adds no model tokens.
     if (typeof files.writeHistory === 'function') {
@@ -529,7 +676,7 @@ export function createAmplifyRunner(options) {
             '',
             '---',
             `完整原文存档：${where}/（已按片切分）`,
-            '要找具体内容时先在这个目录搜索关键词，命中哪个 part-NN.md 再读那一片；索引.md 只用来看整体结构。',
+            '要找具体内容时用 history_search 搜关键词，命中哪个 part-NN.md 再读那一片；索引.md 只用来看整体结构。',
           ].join('\n')
           current.diagnostics.push({ step: 'archive', pages: archived.pages })
           trace(current, `history archived pages=${archived.pages}`)
@@ -541,8 +688,37 @@ export function createAmplifyRunner(options) {
         current.diagnostics.push({ step: 'archive', error: String(error?.message ?? error) })
       }
     }
+    // After the archive pointer, so the note is the last thing the reader sees.
+    if (coverage !== undefined && coverage.ratio < COVERAGE_ENOUGH) {
+      current.summary = `${current.summary}\n\n${coverageNote(coverage, current.locale)}`
+      current.coverage = coverage
+      trace(current, `partial coverage ${Math.floor(coverage.ratio * 100)}%`)
+    }
     current.state = 'done'
     cleanup(current)
+  }
+
+  /**
+   * Read the summary session's event log and measure coverage. Best effort: a missing
+   * session or an older log shape must not fail a run that already has its summary.
+   */
+  function measureCoverage(current) {
+    if (typeof getSession !== 'function') return undefined
+    try {
+      const session = getSession(current.sessionId)
+      if (session === undefined || session === null) return undefined
+      const coverage = readCoverageOf(session)
+      if (coverage === undefined) {
+        trace(current, 'coverage unmeasurable')
+        return undefined
+      }
+      trace(current, `coverage ${Math.floor(coverage.ratio * 100)}% parts=${coverage.parts.length}`)
+      return coverage
+    }
+    catch (error) {
+      warn('amplify coverage failed', error)
+      return undefined
+    }
   }
 
   /** Wait until the agent goes idle; returns its last assistant text. */

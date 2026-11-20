@@ -33,8 +33,9 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, wri
 import { homedir } from 'node:os'
 import { basename, join, resolve } from 'node:path'
 import { inflateRawSync } from 'node:zlib'
-import { chunkTurns, createAmplifyRunner, estimateTokensOf } from './amplify.js'
+import { chunkTurns, createAmplifyRunner } from './amplify.js'
 import { installSummaryPrompt } from './summary-prompt.js'
+import { installHistoryTool } from './history-tool.js'
 
 /** The plugin's own identity, echoed by the patch row and the client bundle. */
 export const name = 'session-slim'
@@ -1308,13 +1309,15 @@ export function planAmplify(buffer, entryName, keepTurns) {
   const dropped = turns.slice(0, turns.length - keep)
   const chunks = chunkTurns(dropped)
   const chars = dropped.reduce((sum, turn) => sum + turn.chars, 0)
+  // No `tokens` here on purpose. The amplify cost is dominated by reading every chunk into
+  // one context, where each read re-bills everything read before it — measured runs came in
+  // 5x the naive "source size" estimate. A number that far off is worse than no number.
   const plan = {
     turns,
     kept: turns.length - dropped.length,
     dropped,
     chunks,
     chars,
-    tokens: estimateTokensOf(chars),
     title: conversation.title,
   }
   planCache = { key: cacheKey, buffer, plan }
@@ -1361,9 +1364,8 @@ export function amplifyPlanHandler(ctx) {
         removedTurns: plan.dropped.length,
         keptTurns: plan.kept,
         chars: plan.chars,
-        tokens: plan.tokens,
         segments: plan.chunks.map((chunk) => ({
-          index: chunk.index, turns: chunk.turns, chars: chunk.chars, tokens: chunk.tokens,
+          index: chunk.index, turns: chunk.turns, chars: chunk.chars,
         })),
       })
     }
@@ -1758,12 +1760,34 @@ export const amplifyFiles = {
 export function apply(ctx) {
   // Amplified sessions get their summary as a scoped system-prompt section, so the model
   // reads it as background instead of as a fresh user message. See summary-prompt.js.
+  const headers = [NOTICES.zh.summaryHeader, NOTICES.en.summaryHeader]
   installSummaryPrompt(ctx, {
-    headers: [NOTICES.zh.summaryHeader, NOTICES.en.summaryHeader],
+    headers,
     warn: (message, error) => { warn(ctx, message, error) },
+  })
+  // Amplified sessions also get `history_search`, so they can look up the dropped turns
+  // by keyword instead of reading whole archive pages. See history-tool.js.
+  installHistoryTool(ctx, {
+    headers,
+    warn: (message, error) => { warn(ctx, message, error) },
+  })
+  // The summary session is read back after the run so the plugin can tell whether it really
+  // read every chunk. Captured once here because `ctx.get()` is not available later.
+  let sessionsService
+  ctx.inject(['sessions'], (sub) => {
+    sessionsService = sub.get('sessions')
   })
   const runner = createAmplifyRunner({
     getController: () => ctx.get('sessionController'),
+    getSession: (id) => {
+      if (sessionsService === undefined || typeof sessionsService.get !== 'function') return undefined
+      try {
+        return sessionsService.get(id)
+      }
+      catch {
+        return undefined
+      }
+    },
     getWorkspacePath: (workspaceId) => {
       const registry = ctx.get('workspaceRegistry')
       if (registry === undefined || typeof registry.get !== 'function') return undefined
