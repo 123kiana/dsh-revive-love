@@ -1,6 +1,6 @@
-{
+﻿{
   "name": "dsh-revive-love",
-  "version": "1.4.0",
+  "version": "1.4.1",
   "description": "Unofficial third-party DSH plugin: revive an over-long DeepSeek chat export by importing only its most recent turns.",
   "keywords": [
     "context",

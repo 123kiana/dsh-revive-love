@@ -52,7 +52,12 @@ const MIN_CONTEXT_CHARS = 120
 /** A query longer than this is almost certainly a paste, not a keyword. */
 const MAX_QUERY_CHARS = 120
 
-/** Output shape: the model sees the rendered `text`. */
+/**
+ * Output shape. The pipeline assigns `output.render(...)` straight to the tool result's
+ * `content` and then calls `content.some(...)` on it, so `render` must return a **content
+ * block array**. Returning the bare string throws `content.some is not a function` at
+ * dispatch time — invisible until a model actually calls the tool (1.4.0 shipped with it).
+ */
 const TEXT_OUTPUT = {
   schema: {
     type: 'object',
@@ -61,7 +66,7 @@ const TEXT_OUTPUT = {
     additionalProperties: false,
   },
   render(_args, value) {
-    return value.text
+    return [{ type: 'text', text: value.text }]
   },
 }
 
