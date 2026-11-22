@@ -3,9 +3,12 @@
  *
  * A revived session carries a summary, not the transcript. The dropped turns sit in
  * `.dsh-revive/history-<id>/part-NN.md`; a big session has dozens of pages, and one page
- * costs ~4,700 tokens *and stays in the context for every later step*. So the model first
- * searches for a keyword (bounded, independent of archive size), and only reads the one
- * page a hit points at when it actually needs the wording.
+ * costs ~4,700 tokens *and stays in the context for every later step*. So the model searches
+ * for a keyword (bounded, independent of archive size) and gets back the **whole turns** its
+ * hits fell in — the user's message and the reply, uncut. It needs both to answer: the facts
+ * are in the words, and the way the two of them were talking is what the next reply should
+ * follow. Whole turns also cost far less than a page and can be dropped when they are done,
+ * where a read page stays in context for every later step.
  *
  * The tool is visible only to agents whose session was amplified: `register` takes a
  * step-time `when` condition, so other conversations never pay for its schema.
@@ -36,18 +39,22 @@ const PART_FILE = /^part-\d+\.md$/
 /** At most this many hits, so one search cannot dominate the context. */
 const MAX_HITS = 5
 
-/** Characters of context on each side of a match, before budget scaling. */
-const CONTEXT_CHARS = 300
-
 /**
- * Total characters of snippets in one result. Headers, the distribution line, hit labels
- * and the trailing path list add roughly 700 more, so the whole answer stays near 2,300
- * characters — about 1,500 tokens for Chinese text, the ceiling this tool is built around.
+ * Longest one turn is rendered.
+ *
+ * The whole turn is the point: it carries the facts *and* the way the two of them were
+ * talking. The bound only guards against a pasted file or a very long scene.
  */
-const SNIPPET_BUDGET_CHARS = 1650
+const TURN_CHARS = 2000
 
-/** Never shrink a snippet below this much context per side. */
-const MIN_CONTEXT_CHARS = 120
+/** Total characters of turn text in one result; a later hit only rides along if it fits. */
+const RESULT_BUDGET_CHARS = 4500
+
+/** Distribution entries shown before collapsing into a count; a common word hits 50+ pages. */
+const DISTRIBUTION_SHOWN = 12
+
+/** Characters on each side of a match used only to count how many query terms co-occur. */
+const CONTEXT_WINDOW_CHARS = 300
 
 /** A query longer than this is almost certainly a paste, not a keyword. */
 const MAX_QUERY_CHARS = 120
@@ -88,17 +95,6 @@ export function archiveDirOf(summary) {
   return undefined
 }
 
-/** How much context each hit gets, so the snippets together stay inside the budget. */
-function contextFor(hits) {
-  const perSide = Math.floor(SNIPPET_BUDGET_CHARS / (2 * Math.max(1, hits)))
-  return Math.max(MIN_CONTEXT_CHARS, Math.min(CONTEXT_CHARS, perSide))
-}
-
-/** Collapse newlines so one hit stays one compact block. */
-function flatten(text) {
-  return text.replace(/\s*\n+\s*/gu, ' ').trim()
-}
-
 /** An archive page's per-turn heading: `### 第 12 轮` or `### Turn 12`. */
 const TURN_HEADING = /^### (?:第 (\d+) 轮|Turn (\d+))\s*$/gmu
 
@@ -135,6 +131,11 @@ export function turnTermsOf(raw) {
   return [`第 ${raw} 轮`, `turn ${raw}`]
 }
 
+/** Numeric page index: part-007.md → 7. */
+function pageNumber(name) {
+  return Number(name.replace(/\D+/gu, '')) || 0
+}
+
 /** Turn headings with their offsets, so a hit can say which turn it fell in. */
 function turnMarks(text) {
   const marks = []
@@ -157,31 +158,39 @@ function turnAt(marks, offset) {
 }
 
 /**
- * Walk every page once and collect up to `limit` non-overlapping hits.
+ * Walk every page once, then pick the hits worth showing.
  *
- * The full match count and its per-page distribution are kept even when only the first few
- * hits are rendered: "how did this end" is answered by where the *last* mention is, and a
- * five-snippet answer would hide exactly that.
+ * Two things matter and neither is "first come":
+ * 1. **How many of the query's terms a window matches.** With OR matching, a page that
+ *    happens to contain one common term can flood the answer; a window containing two or
+ *    three of them is what the asker meant.
+ * 2. **How recent it is.** A revived conversation continues from the end, so a hit on the
+ *    last page usually beats the same hit on page 1.
+ *
+ * The full match count and its per-page distribution are kept regardless: "how did this
+ * end" is answered by where the *last* mention is.
  * @param dirAbsolute - absolute archive directory.
  * @param terms - lowercased keywords, any of which may match.
  * @param limit - maximum hits to keep.
- * @param pad - characters of context on each side.
  * @returns `{ pages, hits, total, clipped, last, distribution }`.
  */
-function scanArchive(dirAbsolute, terms, limit, pad) {
+function scanArchive(dirAbsolute, terms, limit) {
   let names
   try {
-    names = readdirSync(dirAbsolute).filter(name => PART_FILE.test(name)).sort()
+    // Numeric order, not string order: part-100 sorts before part-11 as text, and
+    // that silently breaks the recency ranking this tool relies on.
+    names = readdirSync(dirAbsolute).filter(name => PART_FILE.test(name)).sort((left, right) => pageNumber(left) - pageNumber(right))
   }
   catch {
     return { missing: true }
   }
-  const hits = []
+  /** Every window, with just enough to rank it; the turn is rendered afterwards. */
+  const windows = []
   const perPage = new Map()
   let total = 0
   let pages = 0
   let last
-  for (const page of names) {
+  for (const [pageIndex, page] of names.entries()) {
     let text
     try {
       text = readFileSync(join(dirAbsolute, page), 'utf8')
@@ -210,22 +219,29 @@ function scanArchive(dirAbsolute, terms, limit, pad) {
       perPage.set(page, (perPage.get(page) ?? 0) + 1)
       const turn = turnAt(marks, at)
       last = { page, offset: at, turn }
-      if (hits.length < limit) {
-        const start = Math.max(0, at - pad)
-        const end = Math.min(text.length, at + size + pad)
-        hits.push({
-          page,
-          offset: at,
-          turn,
-          snippet: flatten(text.slice(start, end)),
-          truncatedStart: start > 0,
-          truncatedEnd: end < text.length,
-        })
-      }
+      const start = Math.max(0, at - CONTEXT_WINDOW_CHARS)
+      const end = Math.min(text.length, at + size + CONTEXT_WINDOW_CHARS)
+      // How many distinct terms show up inside this window, not merely at its centre.
+      let matched = 0
+      for (const term of terms) if (haystack.slice(start, end).includes(term)) matched += 1
+      windows.push({ page, pageIndex, at, size, turn, matched })
       // Skip the rest of this window: five copies of one passage help nobody.
-      from = at + size + pad
+      from = at + size + CONTEXT_WINDOW_CHARS
     }
   }
+
+  const ranked = windows
+    .slice()
+    .sort((left, right) => right.matched - left.matched || right.pageIndex - left.pageIndex || left.at - right.at)
+    .slice(0, Math.max(1, limit))
+
+  const hits = ranked.map(window => ({
+    page: window.page,
+    offset: window.at,
+    turn: window.turn,
+    matched: window.matched,
+  }))
+
   return {
     pages,
     hits,
@@ -238,10 +254,6 @@ function scanArchive(dirAbsolute, terms, limit, pad) {
 
 /**
  * Search every page of one archive.
- *
- * The context size is budgeted for the number of hits actually returned: asking for five
- * and finding one would otherwise hand back a one-hit answer with five-hit-length
- * snippets. The second pass only runs in that case, and only reads the pages again.
  * @param dirAbsolute - absolute archive directory.
  * @param query - one or more keywords, or a bare turn number; matched case-insensitively.
  * @param limit - maximum hits.
@@ -250,13 +262,7 @@ function scanArchive(dirAbsolute, terms, limit, pad) {
 export function searchArchive(dirAbsolute, query, limit) {
   const terms = turnTermsOf(query) ?? splitTerms(query)
   if (terms.length === 0) return { pages: 0, hits: [], total: 0, clipped: false, distribution: [] }
-  const narrow = contextFor(limit)
-  let found = scanArchive(dirAbsolute, terms, limit, narrow)
-  if (found.missing !== true && found.hits.length > 0 && found.hits.length < limit) {
-    const wider = contextFor(found.hits.length)
-    if (wider > narrow) found = scanArchive(dirAbsolute, terms, limit, wider)
-  }
-  return found
+  return scanArchive(dirAbsolute, terms, limit)
 }
 
 /** `part-03.md` → `part-03`, so the distribution line stays short. */
@@ -267,6 +273,49 @@ function shortPage(page) {
 /** `第 41 轮` when the hit fell inside one, otherwise an empty string. */
 function turnLabel(turn) {
   return Number.isFinite(turn) ? `第 ${turn} 轮` : ''
+}
+
+/** Turn heading, numbered only: a reply may carry markdown headings of its own. */
+const TURN_AT = /^### (?:第 (\d+) 轮|Turn (\d+))\s*$/gmu
+
+/**
+ * Read the complete turn a hit fell in: the user's line and the reply, from archived heading
+ * to the next one.
+ *
+ * This is what the tool hands the model now. It used to return a 300-character window around
+ * the keyword, which starts and ends mid-sentence and loses exactly the register the reply
+ * should follow. A whole turn is small (measured: 200–1,300 characters, 4,900 at the extreme)
+ * and it is both the fact and the voice.
+ * @param text - one archive page.
+ * @param turn - the turn number the hit landed in.
+ * @param maxChars - clip beyond this many characters.
+ * @returns the turn text, or undefined when the page does not hold that turn.
+ */
+export function turnBlock(text, turn, maxChars = TURN_CHARS) {
+  if (!Number.isFinite(turn)) return undefined
+  TURN_AT.lastIndex = 0
+  let start = -1
+  let match
+  while ((match = TURN_AT.exec(text)) !== null) {
+    if (start < 0) {
+      if (Number(match[1] ?? match[2]) === turn) start = match.index
+      continue
+    }
+    return clipBlock(text.slice(start, match.index), maxChars)
+  }
+  if (start < 0) return undefined
+  return clipBlock(text.slice(start), maxChars)
+}
+
+/**
+ * Trim one turn that is longer than the bound, with a visible marker.
+ * @param block - the raw turn text.
+ * @param maxChars - the bound.
+ * @returns the turn text.
+ */
+function clipBlock(block, maxChars) {
+  const value = block.trim()
+  return value.length > maxChars ? `${value.slice(0, maxChars)}…（这一段太长，后面略）` : value
 }
 
 /**
@@ -298,21 +347,39 @@ export function formatResult(query, found, dirAbsolute) {
   const shown = found.hits.length < found.total ? `，先显示前 ${found.hits.length} 处` : ''
   const lines = [`在 ${found.pages} 片存档里找到 ${found.total} 处「${query}」${shown}：`]
   if (found.total > 1 && found.distribution.length > 0) {
-    lines.push(`分布：${found.distribution.map(item => `${shortPage(item.page)}(${item.count})`).join(' / ')}`)
+    const shown = found.distribution.slice(0, DISTRIBUTION_SHOWN)
+    const rest = found.distribution.length - shown.length
+    lines.push(`分布：${shown.map(item => `${shortPage(item.page)}(${item.count})`).join(' / ')}${rest > 0 ? ` …（共 ${found.distribution.length} 片）` : ''}`)
   }
   if (found.clipped && found.last !== undefined) {
     const where = `${shortPage(found.last.page)}${turnLabel(found.last.turn) === '' ? '' : ` ${turnLabel(found.last.turn)}`}`
     lines.push(`最后一次出现在 ${where} —— 「后来怎么样了」这类问题通常要看这处附近。`)
   }
-  found.hits.forEach((hit, index) => {
-    const turn = turnLabel(hit.turn)
+  if (found.hits.length > 0) {
     lines.push('')
-    lines.push(`${index + 1}) ${shortPage(hit.page)}${turn === '' ? '' : ` ${turn}`}（字符 ${hit.offset} 附近）`)
-    lines.push(`${hit.truncatedStart ? '…' : ''}${hit.snippet}${hit.truncatedEnd ? '…' : ''}`)
-  })
+    lines.push('命中所在的整轮原文（你当时那句 + 你的回复）：')
+  }
+  let budget = RESULT_BUDGET_CHARS
+  for (const [index, hit] of found.hits.entries()) {
+    let text
+    try {
+      text = readFileSync(join(dirAbsolute, hit.page), 'utf8')
+    }
+    catch {
+      continue
+    }
+    const block = turnBlock(text, hit.turn)
+    if (block === undefined) continue
+    // The first hit always goes in; later ones only if they fit.
+    if (index > 0 && block.length > budget) continue
+    budget -= block.length
+    lines.push('')
+    lines.push(`${index + 1}) ${shortPage(hit.page)} ${turnLabel(hit.turn) || `字符 ${hit.offset} 附近`}`)
+    lines.push(block)
+  }
   const pages = [...new Set(found.hits.map(hit => hit.page))]
   lines.push('')
-  lines.push('要看完整的上下文就读这几片（一次读一片，读完记住了就别再读第二片）：')
+  lines.push('要看邻近的几轮就读这几片（一次读一片，读完记住了就别再读第二片）：')
   for (const page of pages) lines.push(`- ${join(dirAbsolute, page)}`)
   return lines.join('\n')
 }
@@ -362,7 +429,7 @@ export function installHistoryTool(ctx, options) {
       description:
         '在自己的历史原文存档里搜索：这个会话更早的部分已被压缩成摘要，存档里是逐字原话。'
         + '用户问「还记得」「之前说过」「当时我怎么说的」这类需要原话的问题时，先用它查，再回答；别凭摘要或印象编。'
-        + '回复给出命中总数、分布、最后一次出现的位置和几段片段；要看完整一片再用 read 读它给的路径。',
+        + '回复给出命中总数、分布，并把命中所在的**整轮原文**（用户那句 + 你当时的回复）交回来；要看邻近几轮再用 read 读它给的路径。',
       parameters: {
         type: 'object',
         properties: {
@@ -372,7 +439,7 @@ export function installHistoryTool(ctx, options) {
           },
           limit: {
             type: 'number',
-            description: `最多显示几段片段，默认 ${MAX_HITS}，上限也是 ${MAX_HITS}。总数与分布不受影响。`,
+            description: `最多返回几轮原文，默认 ${MAX_HITS}，上限也是 ${MAX_HITS}。总数与分布不受影响。`,
           },
         },
         required: ['query'],
@@ -416,4 +483,4 @@ export function installHistoryTool(ctx, options) {
   })
 }
 
-export { ARCHIVE_MARKER, MAX_HITS, PART_FILE, SNIPPET_BUDGET_CHARS }
+export { ARCHIVE_MARKER, MAX_HITS, PART_FILE, RESULT_BUDGET_CHARS, TURN_CHARS }

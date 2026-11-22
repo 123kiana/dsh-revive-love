@@ -42,7 +42,10 @@ window.__ModuleLoader__.load({
     const AMPLIFY_STATUS_ROUTE = '/dsh-session-slim/amplify/status'
     const AMPLIFY_CANCEL_ROUTE = '/dsh-session-slim/amplify/cancel'
     const AMPLIFY_DECIDE_ROUTE = '/dsh-session-slim/amplify/decide'
-    /** The shipped import action's upload route (its `protocol.ts` UPLOAD_ROUTE). */
+    /** Forced-recall switch, read and written for the conversation in view. */
+    const FORCE_ROUTE = '/dsh-session-slim/force-recall'
+    /** What the last turn's recall actually did; shown in the mode panel. */
+        /** The shipped import action's upload route (its `protocol.ts` UPLOAD_ROUTE). */
     const IMPORT_ROUTE = 'api/deepseek-chat-import/archive'
     /** Turns offered by default when a conversation is picked. */
     const DEFAULT_KEEP = 10
@@ -56,6 +59,15 @@ window.__ModuleLoader__.load({
     /** Simplified Chinese dictionary (the key-set source of truth). */
     const ZH = {
       'action.label': '复活吧我的爱人',
+      'recall.title': '回忆模式',
+      'recall.body': '打开后：每一轮都会强制提醒你先调 history_search 查旧原文（整句只是语气词、没有实际内容时除外），同时调高采样温度、屏蔽不必要的上下文注入。开着时每条消息都会多一次工具往返的 token 开销；插件自己不搜、不判断，也不额外调用模型。',
+      'recall.mode.off': '关',
+      'recall.mode.fact': '增强记忆与语气',
+      'recall.hint.off': '回忆模式：关',
+      'recall.hint.fact': '增强记忆与语气已开启',
+      'recall.notRevived': '这个开关只对复活会话有用',
+      'recall.failed': '切换失败，请稍后再试',
+      // Status of the last turn; recall is invisible, so the panel has to report it.
       'dialog.title': '复活吧我的爱人',
       'dialog.description': '把一个过长的对话裁短后再导入，避免超出模型上下文上限。',
       'dialog.step': '第 {step} / 3 步',
@@ -81,15 +93,13 @@ window.__ModuleLoader__.load({
       'step.pick.empty': '没有匹配的对话。',
       'step.pick.omitted': '另有 {count} 个更早的对话未列出。',
       'step.pick.turns': '{count} 轮',
-      'step.pick.tokens': '约 {tokens} token',
       'step.pick.updated': '更新于 {time}',
       'step.config.title': '3. 设定保留范围',
       'step.config.keep': '保留最近多少轮',
       'step.config.keepHint': '可保留 1–{max} 轮',
       'step.config.keptTurns': '保留 {count} 轮',
       'step.config.dropped': '丢弃前 {count} 轮',
-      'step.config.tokens': '估算约 {tokens} token',
-      'step.config.overBudget': '仍然超过历史预算（约 {budget} token），建议再减少保留轮数。',
+      'step.config.overBudget': '保留的内容已经很长，很可能超出模型的上下文窗口；建议再减少保留轮数。',
       'step.config.note': '补充说明（作为第一条 USER 消息）',
       'step.config.noteHint': '留空则不插入说明。',
       'step.config.workspace': '导入到工作区',
@@ -104,6 +114,7 @@ window.__ModuleLoader__.load({
       'amplify.model': '模型：flash、思考关闭',
       'amplify.segments': '会写成 {count} 个文件，交给一条总结会话读完并压缩',
       'amplify.cost': '会把整段对话一次性读进上下文，消耗的 token 远高于日常对话；这项任务几乎没有缓存可用',
+      'amplify.used': '已用 {tokens} token',
       'amplify.failure': '需要等待，期间可能失败或超时；失败时可以选择不带摘要继续',
       'amplify.confirm': '我已了解，开启',
       'amplify.planning': '正在计算分段…',
@@ -124,8 +135,7 @@ window.__ModuleLoader__.load({
       'result.title': '复活完成',
       'result.name': '新会话标题：{title}',
       'result.turns': '保留 {kept} 轮（丢弃 {removed} 轮）',
-      'result.tokens': '估算约 {tokens} token',
-      'result.partial': '这次摘要只读到原文的 {percent}%（较早的部分没进摘要）。原文已存档，需要时让模型用 history_search 去查，别当作没发生过。',
+      'result.partial': '这次摘要覆盖了较早内容的 {percent}%，剩下的部分没有进摘要。原文仍完整存档。',
       'result.imported': '已直接导入到工作区，共 {count} 个新会话。',
       'result.downloaded': '已下载 {name}。请用侧边栏的「导入 DeepSeek 会话」按钮导入它。',
       'result.downloadedNoPlugin': '已下载 {name}，但没有找到官方导入插件；请先安装「导入 DeepSeek 会话」再导入这个文件。',
@@ -156,6 +166,14 @@ window.__ModuleLoader__.load({
     /** English dictionary, complete against the Chinese key set. */
     const EN = {
       'action.label': 'Revive my love',
+      'recall.title': 'Recall mode',
+      'recall.body': 'When on: every turn is required to look up the original wording with history_search first (unless the message is nothing but filler), the sampling temperature is raised, and unnecessary context injections are hidden. Each message costs one extra tool round-trip in tokens. The plugin itself does not search, judge, or call any model.',
+      'recall.mode.off': 'Off',
+      'recall.mode.fact': 'Enhanced recall & tone',
+      'recall.hint.off': 'Recall mode: off',
+      'recall.hint.fact': 'Enhanced recall & tone on',
+      'recall.notRevived': 'This switch only applies to a revived conversation',
+      'recall.failed': 'Could not switch it, try again',
       'dialog.title': 'Revive my love',
       'dialog.description': 'Shorten one over-long conversation before importing it, so it fits the model context window.',
       'dialog.step': 'Step {step} of 3',
@@ -181,15 +199,13 @@ window.__ModuleLoader__.load({
       'step.pick.empty': 'No conversation matches.',
       'step.pick.omitted': '{count} older conversations are not listed.',
       'step.pick.turns': '{count} turns',
-      'step.pick.tokens': 'about {tokens} tokens',
       'step.pick.updated': 'updated {time}',
       'step.config.title': '3. Choose what to keep',
       'step.config.keep': 'Keep the most recent turns',
       'step.config.keepHint': '1–{max} turns can be kept',
       'step.config.keptTurns': 'Keeping {count} turns',
       'step.config.dropped': 'Dropping the first {count} turns',
-      'step.config.tokens': 'about {tokens} tokens',
-      'step.config.overBudget': 'Still over the history budget (about {budget} tokens); keep fewer turns.',
+      'step.config.overBudget': 'That is already a lot of text and will very likely exceed the context window; keep fewer turns.',
       'step.config.note': 'Note (inserted as the first USER message)',
       'step.config.noteHint': 'Leave empty to insert nothing.',
       'step.config.workspace': 'Import into workspace',
@@ -204,6 +220,7 @@ window.__ModuleLoader__.load({
       'amplify.model': 'Model: flash, reasoning off',
       'amplify.segments': 'Writes {count} file(s) for one summary session to read and condense',
       'amplify.cost': 'Reads the whole history into one context at once, so it burns far more tokens than everyday chatting, with almost no cache reuse',
+      'amplify.used': 'used {tokens} tokens',
       'amplify.failure': 'It takes a while and may fail or stall; if it does you can continue without the summary',
       'amplify.confirm': 'I understand, turn it on',
       'amplify.planning': 'Working out the segments…',
@@ -224,8 +241,7 @@ window.__ModuleLoader__.load({
       'result.title': 'Revived',
       'result.name': 'New conversation title: {title}',
       'result.turns': 'Kept {kept} turns (dropped {removed})',
-      'result.tokens': 'about {tokens} tokens',
-      'result.partial': 'This summary covered only {percent}% of the source; the earlier part is missing. The full text is archived — have the model search it with history_search instead of assuming it never happened.',
+      'result.partial': 'This summary covers {percent}% of the earlier part; the rest did not make it in. The full text is still archived.',
       'result.imported': 'Imported directly into the workspace: {count} new sessions.',
       'result.downloaded': 'Downloaded {name}. Import it with the sidebar’s “Import DeepSeek chats” action.',
       'result.downloadedNoPlugin': 'Downloaded {name}, but the official import plugin is not installed; install “Import DeepSeek chats” first.',
@@ -254,7 +270,7 @@ window.__ModuleLoader__.load({
     }
 
     /** Context facts the picker marks conversations with (the Host reports the same values). */
-    const HISTORY_BUDGET_TOKENS = 790000
+    const HISTORY_BUDGET_CHARS = 700000
 
     let ctxRef
 
@@ -349,7 +365,7 @@ window.__ModuleLoader__.load({
       return bytes + ' B'
     }
 
-    /** A number as a short human string (`12.3k`, `1.2M`). */
+    /** A number as a short human string (`12.3k`, `1.2M`). Used for measured usage only. */
     function formatTokens(value) {
       const number = typeof value === 'number' && Number.isFinite(value) ? value : 0
       if (number >= 1000000) return `${(number / 1000000).toFixed(1)}M`
@@ -469,24 +485,6 @@ window.__ModuleLoader__.load({
       return total + (keep - chars.length) * average
     }
 
-    /**
-     * Estimate the kept tokens for one conversation, from the Host's per-turn
-     * token counts; older turns fall back to the average of the sent tail.
-     */
-    function estimateKeptTokens(item, keep) {
-      const values = Array.isArray(item.turnTokens) ? item.turnTokens : []
-      if (values.length === 0) return Math.round(estimateKeptChars(item, keep) / 1.6)
-      if (keep <= values.length) {
-        let sum = 0
-        for (let index = values.length - keep; index < values.length; index += 1) sum += values[index]
-        return Math.round(sum)
-      }
-      let total = 0
-      for (const value of values) total += value
-      const average = total / values.length
-      return Math.round(total + (keep - values.length) * average)
-    }
-
     /** A store hook or a constant-empty stand-in, so the hook call count stays stable. */
     function hookFrom(props, name) {
       return typeof props[name] === 'function' ? props[name] : emptySelector
@@ -590,9 +588,9 @@ window.__ModuleLoader__.load({
       const chosenWorkspaceId = workspaceId !== undefined ? workspaceId : suggestedWorkspace
 
       const conversations = archive === null ? [] : archive.conversations
-      const budget = archive !== null && archive.limits !== undefined && typeof archive.limits.historyBudgetTokens === 'number'
-        ? archive.limits.historyBudgetTokens
-        : HISTORY_BUDGET_TOKENS
+      const budget = archive !== null && archive.limits !== undefined && typeof archive.limits.historyBudgetChars === 'number'
+        ? archive.limits.historyBudgetChars
+        : HISTORY_BUDGET_CHARS
       const recommend = archive !== null && archive.limits !== undefined && typeof archive.limits.recommendTurns === 'number'
         ? archive.limits.recommendTurns
         : 500
@@ -613,7 +611,7 @@ window.__ModuleLoader__.load({
 
       const maxKeep = selected === undefined ? 0 : Math.min(selected.turns, keepCeiling)
       const keptChars = selected === undefined ? 0 : estimateKeptChars(selected, keep)
-      const keptTokens = selected === undefined ? 0 : estimateKeptTokens(selected, keep)
+      const keptCharsEstimate = selected === undefined ? 0 : estimateKeptChars(selected, keep)
       const dropped = selected === undefined ? 0 : Math.max(0, selected.turns - keep)
 
       useEffect(() => {
@@ -1001,7 +999,7 @@ window.__ModuleLoader__.load({
             title: headerValue(response, 'x-dsh-slim-title') || selected.title,
             keptTurns: Number(headerValue(response, 'x-dsh-slim-kept-turns') || keep),
             removedTurns: Number(headerValue(response, 'x-dsh-slim-removed-turns') || 0),
-            estTokens: Number(headerValue(response, 'x-dsh-slim-est-tokens') || 0),
+            keptChars: Number(headerValue(response, 'x-dsh-slim-kept-chars') || 0),
             fileName: headerValue(response, 'x-dsh-slim-filename') || 'deepseek_data-slim.zip',
           }
           setBusy('import')
@@ -1179,7 +1177,6 @@ window.__ModuleLoader__.load({
             ),
             h('span', { className: 'dsh-slim-meta' },
               h(Meta, null, t('step.pick.turns', { count: String(item.turns) })),
-              h(Meta, null, t('step.pick.tokens', { tokens: formatTokens(item.estTokens) })),
               h(Meta, null, t('step.pick.updated', { time: formatTime(item.updatedAt) })),
             ),
           )
@@ -1252,10 +1249,8 @@ window.__ModuleLoader__.load({
             t('step.config.keptTurns', { count: String(Math.min(keep, Math.max(0, maxKeep))) }),
             ' · ',
             t('step.config.dropped', { count: String(dropped) }),
-            ' · ',
-            t('step.config.tokens', { tokens: formatTokens(keptTokens) }),
           ),
-          keptTokens > budget ? h('p', { className: 'dsh-slim-warn' }, t('step.config.overBudget', { budget: formatTokens(budget) })) : null,
+          keptCharsEstimate > budget ? h('p', { className: 'dsh-slim-warn' }, t('step.config.overBudget')) : null,
           h('div', { className: 'dsh-slim-field' },
             h('label', { className: 'dsh-slim-label', htmlFor: 'dsh-slim-note' }, t('step.config.note')),
             h('textarea', {
@@ -1361,9 +1356,6 @@ window.__ModuleLoader__.load({
           h('p', { className: 'dsh-slim-summary-line' }, t('result.turns', {
             kept: String(result === null ? 0 : result.keptTurns),
             removed: String(result === null ? 0 : result.removedTurns),
-          })),
-          h('p', { className: 'dsh-slim-summary-line' }, t('result.tokens', {
-            tokens: formatTokens(result === null ? 0 : result.estTokens),
           })),
           amplifyCoverage === null ? null : h('p', { className: 'dsh-slim-warn' }, t('result.partial', {
             percent: String(Math.floor((amplifyCoverage.ratio ?? 0) * 100)),
@@ -1491,7 +1483,7 @@ window.__ModuleLoader__.load({
           ),
           h('p', { className: 'dsh-slim-float-line' }, t('amplify.progress', { count: String(amplifyProgress.count) })),
           h('p', { className: 'dsh-slim-float-meta' },
-            `${formatElapsed(elapsedSeconds)} · ${formatTokens(amplifyTokens)} token`),
+            `${formatElapsed(elapsedSeconds)} · ${t('amplify.used', { tokens: formatTokens(amplifyTokens) })}`),
           h('button', {
             type: 'button',
             className: 'dsh-slim-button',
@@ -1515,21 +1507,162 @@ window.__ModuleLoader__.load({
       )
     }
 
-    /** The sidebar trigger and, while open, the wizard. */
+    /** Long-press duration on the sidebar trigger that toggles forced-recall mode. */
+    const LONG_PRESS_MS = 1000
+
+    /**
+     * The sidebar trigger and, while open, the wizard.
+     *
+     * Holding the trigger for a second toggles forced-recall mode for the conversation in
+     * view. It only works there if the conversation is a revived one: the paragraph tells
+     * the model to use a tool that session does not have, so the plugin's answer decides
+     * rather than the UI guessing.
+     */
     function SlimAction(props) {
       const t = makeT(props)
       const [open, setOpen] = useState(false)
       const wide = props.wide === true
+      const useSessions = hookFrom(props, 'useSessions')
+      const sessionsById = useSessions(state => state.byId) || {}
+      const currentSessionId = useMemo(() => {
+        for (const session of Object.values(sessionsById)) {
+          if (session === null || typeof session !== 'object') continue
+          if (session.retainedBy !== undefined && session.retainedBy !== null && (session.retainedBy.mainView || 0) > 0) return session.id
+        }
+        return undefined
+      }, [sessionsById])
+
+      const [recall, setRecall] = useState(null)
+      const [hint, setHint] = useState(null)
+      const [picker, setPicker] = useState(false)
+      const press = useRef(null)
+      const suppressClick = useRef(false)
+      const hintTimer = useRef(null)
+
+      /** Show one short-lived line of feedback under the sidebar. */
+      const flash = useCallback((text) => {
+        setHint(text)
+        if (hintTimer.current !== null) clearTimeout(hintTimer.current)
+        hintTimer.current = setTimeout(() => { setHint(null); hintTimer.current = null }, 2200)
+      }, [])
+
+      /** Read the mode for the conversation in view. */
+      const refresh = useCallback(async () => {
+        if (typeof currentSessionId !== 'string') { setRecall(null); return }
+        try {
+          const response = await fetch(routeUrl(FORCE_ROUTE), {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ sessionId: currentSessionId }),
+          })
+          if (!response.ok) { setRecall(null); return }
+          const payload = await response.json()
+          setRecall(payload !== null && typeof payload === 'object'
+            ? { revived: payload.revived === true, mode: typeof payload.mode === 'string' ? payload.mode : 'off' }
+            : null)
+        }
+        catch {
+          setRecall(null)
+        }
+      }, [currentSessionId])
+
+      useEffect(() => { void refresh() }, [refresh])
+
+      useEffect(() => () => {
+        if (press.current !== null) clearTimeout(press.current)
+        if (hintTimer.current !== null) clearTimeout(hintTimer.current)
+      }, [])
+
+      /** Write the mode and report what the host actually stored. */
+      const apply = useCallback(async (mode) => {
+        if (typeof currentSessionId !== 'string') return
+        try {
+          const response = await fetch(routeUrl(FORCE_ROUTE), {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ sessionId: currentSessionId, mode }),
+          })
+          const payload = await response.json().catch(() => null)
+          if (!response.ok || payload?.ok !== true) {
+            flash(t('recall.failed'))
+            return
+          }
+          const stored = typeof payload.mode === 'string' ? payload.mode : 'off'
+          setRecall({ revived: true, mode: stored })
+          flash(t(`recall.hint.${stored}`))
+        }
+        catch {
+          flash(t('recall.failed'))
+        }
+      }, [currentSessionId, flash, t])
+
+      /** A finished long press: open the picker, or explain why it cannot. */
+      const longPress = useCallback(() => {
+        suppressClick.current = true
+        if (recall === null || recall.revived !== true) {
+          flash(t(recall === null ? 'recall.failed' : 'recall.notRevived'))
+          return
+        }
+        setPicker(true)
+      }, [flash, recall, t])
+
+      const startPress = useCallback((event) => {
+        if (event !== undefined && event.button !== undefined && event.button !== 0) return
+        if (press.current !== null) clearTimeout(press.current)
+        press.current = setTimeout(() => {
+          press.current = null
+          longPress()
+        }, LONG_PRESS_MS)
+      }, [longPress])
+
+      const cancelPress = useCallback(() => {
+        if (press.current !== null) { clearTimeout(press.current); press.current = null }
+      }, [])
+
+      const mode = recall === null ? 'off' : recall.mode
+      const label = `${t('recall.title')}：${t(`recall.mode.${mode}`)}`
+
       return h(React.Fragment, null,
         props.children === undefined ? null : props.children,
         h('button', {
           type: 'button',
-          className: 'dsh-slim-trigger',
-          'aria-label': t('action.label'),
-          title: t('action.label'),
-          onClick: () => { setOpen(true) },
+          className: `dsh-slim-trigger${mode === 'off' ? '' : ' dsh-slim-trigger-red'}`,
+          'aria-label': `${t('action.label')} — ${label}`,
+          title: `${t('action.label')}（长按 1 秒：${label}）`,
+          onPointerDown: startPress,
+          onPointerUp: cancelPress,
+          onPointerLeave: cancelPress,
+          onPointerCancel: cancelPress,
+          onKeyDown: (event) => {
+            // Keyboard equivalent of the long press.
+            if (event.key !== ' ' && event.key !== 'Enter') return
+            if (!event.altKey) return
+            event.preventDefault()
+            longPress()
+          },
+          onClick: () => {
+            if (suppressClick.current) { suppressClick.current = false; return }
+            setOpen(true)
+          },
         }, h(TriggerIcon, { size: wide ? 16 : 18 })),
-        open ? h(Wizard, { props, t, onClose: () => { setOpen(false) } }) : null,
+        hint === null ? null : h('div', { className: 'dsh-slim-toast', role: 'status' }, hint),
+        picker ? h('div', { className: 'dsh-slim-confirm', role: 'dialog', 'aria-modal': 'true' },
+          h('h3', { className: 'dsh-slim-confirm-title' }, t('recall.title')),
+          h('p', { className: 'dsh-slim-confirm-body' }, t('recall.body')),
+          h('div', { className: 'dsh-slim-mode-list' },
+            ...['off', 'fact'].map(option => {
+              const active = mode === option
+              return h('button', {
+                key: option,
+                type: 'button',
+                className: `dsh-slim-button dsh-slim-mode${active ? ' dsh-slim-primary' : ''}`,
+                'aria-pressed': active,
+                onClick: () => { setPicker(false); void apply(option) },
+              }, t(`recall.mode.${option}`))
+            }),
+          ),
+        ) : null,
+        open ? h(Wizard, { props, t, onClose: () => { setOpen(false); void refresh() } }) : null,
       )
     }
 
@@ -1564,6 +1697,16 @@ window.__ModuleLoader__.load({
 .dsh-slim-trigger{display:inline-flex;align-items:center;justify-content:center;width:26px;height:26px;margin-left:4px;padding:0;border:0;border-radius:6px;background:transparent;color:inherit;opacity:.72;cursor:pointer;flex:0 0 auto}
 .dsh-slim-trigger:hover{opacity:1;background:var(--dsw-alias-fill-quaternary,rgba(128,128,128,.16))}
 .dsh-slim-trigger:focus-visible{outline:2px solid var(--dsw-alias-brand-primary,Highlight);outline-offset:1px}
+/* Forced-recall on: the same trigger turns red. */
+.dsh-slim-trigger-red{color:#dc2626;opacity:1}
+.dsh-slim-trigger-red:hover{color:#dc2626;background:rgba(220,38,38,.12)}
+.dsh-slim-toast{position:fixed;left:50%;bottom:28px;z-index:1100;transform:translateX(-50%);max-width:min(420px,80vw);padding:7px 14px;border:1px solid var(--dsw-alias-border-subtle,rgba(128,128,128,.32));border-radius:999px;background:var(--dsw-alias-bg-elevated,Canvas);color:var(--dsw-alias-text-primary,CanvasText);box-shadow:0 8px 24px rgba(0,0,0,.28);font:inherit;font-size:12px;line-height:1.4;text-align:center;pointer-events:none}
+.dsh-slim-confirm{position:fixed;left:50%;top:50%;z-index:1100;transform:translate(-50%,-50%);width:min(360px,86vw);padding:18px 18px 14px;border:1px solid var(--dsw-alias-border-subtle,rgba(128,128,128,.32));border-radius:12px;background:var(--dsw-alias-bg-elevated,Canvas);color:var(--dsw-alias-text-primary,CanvasText);box-shadow:0 16px 48px rgba(0,0,0,.38);font:inherit;font-size:13px;line-height:1.5}
+.dsh-slim-confirm-title{margin:0 0 8px;font-size:14px;font-weight:600}
+.dsh-slim-confirm-body{margin:0 0 14px;color:var(--dsw-alias-text-secondary,GrayText);font-size:12.5px}
+.dsh-slim-confirm-actions{display:flex;justify-content:flex-end;gap:8px}
+.dsh-slim-mode-list{display:flex;flex-direction:column;gap:8px}
+.dsh-slim-mode{width:100%;justify-content:flex-start}
 .dsh-slim-overlay{position:fixed;inset:0;z-index:1000;display:flex;align-items:center;justify-content:center;padding:24px;background:rgba(0,0,0,.42)}
 .dsh-slim-dialog{display:flex;flex-direction:column;width:min(620px,100%);max-height:min(86vh,760px);border:1px solid var(--dsw-alias-border-subtle,rgba(128,128,128,.32));border-radius:12px;background:var(--dsw-alias-bg-elevated,Canvas);color:var(--dsw-alias-text-primary,CanvasText);box-shadow:0 16px 48px rgba(0,0,0,.38);font:inherit;font-size:13px;line-height:1.5;overflow:hidden}
 .dsh-slim-dialog:focus{outline:none}

@@ -125,6 +125,9 @@ export function summaryPrompt(dirRelative, chunkCount, locale) {
       `The chat history of an earlier part of a conversation was written to \`${fileHint}\` (${chunkCount} file(s), in order).`,
       'Read all of it and condense it into one compact memory note another assistant can use to continue that conversation.',
       'Keep: decisions, preferences, commitments, open threads, recurring jokes, and tone. Drop: pleasantries and repetition.',
+      // Measured failure: the agent answered "I'll read the remaining parts of file 1 and file 3"
+      // and ended the turn, so the run finished with 51 characters and 61% read.
+      'Do not describe what you are about to do — do it. Read every file to the end before you answer.',
       // Answering in the chat is the contract: writing a file inside the workspace can be
       // blocked by the sandbox's folder grants, and a summary that arrives is worth more
       // than a tidy file that does not.
@@ -136,11 +139,47 @@ export function summaryPrompt(dirRelative, chunkCount, locale) {
     `一段较早的聊天记录已经写到 \`${fileHint}\`（共 ${chunkCount} 个文件，按顺序）。`,
     '请全部读完，压缩成一份紧凑的记忆笔记，供另一个助手继续这段对话时使用。',
     '保留：结论、偏好、承诺、未完成的事、反复出现的梗与语气。删掉：客套和重复。',
+    // 实测翻车：它回了一句「I'll read the remaining parts…」就结束了这一轮，
+    // 于是 51 字的“摘要”被当成结果，读完的比例只有 61%。
+    '不要在回复里描述你打算做什么——直接做。每个文件都要读到结尾再回答。',
     // 直接把笔记回复在对话里：在工作区里写文件可能被沙箱的目录授权挡住，
     // 拿到摘要比留下一个整齐的文件更重要。
     '把你的最终回复本身写成这份笔记，不要询问确认、不要只回复“完成”。',
     '用原文的语言写。',
   ].join('\n')
+}
+
+/** Longest reply still treated as a status line rather than a memory note. */
+export const SUMMARY_MIN_CHARS = 200
+
+/** Phrases that mean "about to read" rather than "here is the note". */
+const NARRATION = /^(?:我(先|来|现在)?(去|要|会)?(读|看|检查|整理|开始)|正在读|开始读|let me|i'?ll|i will|i'?m going to)/iu
+
+/**
+ * Whether a reply can stand in as the memory note.
+ *
+ * A short reply is a status line, not a note: measured, a run ended with
+ * "I'll read the remaining parts of file 1 and file 3" (51 characters) and was accepted as the
+ * summary, which then went into a revived conversation as its only memory.
+ * @param text - the candidate summary.
+ * @returns whether it is substantial enough to keep.
+ */
+export function looksLikeSummary(text) {
+  const value = String(text ?? '').trim()
+  if (value.length < SUMMARY_MIN_CHARS) return false
+  if (NARRATION.test(value) && value.length < SUMMARY_MIN_CHARS * 3) return false
+  return true
+}
+
+/**
+ * What to send when the first attempt only narrated its plan.
+ * @param locale - `zh` or `en`.
+ * @returns the follow-up prompt.
+ */
+export function summaryNudge(locale) {
+  return locale === 'en'
+    ? 'You described what you were about to do and then stopped. Read the remaining part(s) to the end now, and reply with the finished memory note itself.'
+    : '你刚才只描述了打算做什么就停下来了。现在把剩下的文件读完，并直接把写完的记忆笔记作为回复。'
 }
 
 /** Title for the summary session. */
@@ -346,12 +385,12 @@ export function readCoverageOf(session) {
 }
 
 /**
- * Tell the reader that the summary is incomplete, in a way the revived model cannot miss.
- * Silently covering two thirds of the history is worse than saying so: the model would
- * treat "not in the summary" as "never happened".
+ * State the coverage as a fact. The instruction that follows from it ("check the archive
+ * when the wording matters") belongs in the hidden system-prompt section: this text lands
+ * in the visible conversation history, where imperative wording reads like an injection.
  * @param coverage - the result of {@link readCoverageOf}.
  * @param locale - `zh` or `en`.
- * @returns the note to append to the summary.
+ * @returns the fact line to append to the summary.
  */
 export function coverageNote(coverage, locale) {
   const percent = Math.floor(coverage.ratio * 100)
@@ -364,29 +403,66 @@ export function coverageNote(coverage, locale) {
   if (locale === 'en') {
     return [
       '---',
-      `【Coverage】This summary read only ${percent}% of the archive${detail === '' ? '' : ` (${detail})`}.`,
-      'The unread part is the earlier part of the conversation. It is not in the summary above,',
-      'but it did happen: use history_search on the archive when it matters, and never assume',
-      '"not in the summary" means "never happened".',
+      `【Coverage】This summary covers ${percent}% of the earlier part${detail === '' ? '' : ` (${detail})`}.`,
     ].join('\n')
   }
   return [
     '---',
-    `【覆盖说明】这份摘要只读到存档的 ${percent}%${detail === '' ? '' : `（${detail}）`}。`,
-    '没读到的是较早的那部分。那些内容不在上面的摘要里，但它们发生过 ——',
-    '需要时用 history_search 查存档，不要因为摘要里没有就当它没发生过。',
+    `【覆盖范围】这份摘要覆盖了较早内容的 ${percent}%${detail === '' ? '' : `（${detail}）`}。`,
   ].join('\n')
 }
 
 /**
+ * Put the deployment default model back after a summary run.
+ *
+ * `sessionController.selectModel` also saves the *deployment* default, so picking a cheap
+ * model for the summary session silently changes what every new conversation starts with —
+ * measured: after one amplify run, new conversations defaulted to flash/off, which the user
+ * never chose. The restore only happens while the default still equals what this run
+ * installed: a user who picked a different model meanwhile keeps their own choice.
+ * @param options - `{ controller, sessionId, before, applied, readDefault, warn }`.
+ * @returns whether the default was restored.
+ */
+export async function restoreDefaultSelection(options) {
+  const { controller, sessionId, before, applied, readDefault, warn: onWarn } = options
+  const same = (left, right) => left !== undefined && left !== null && right !== undefined && right !== null
+    && left.provider === right.provider
+    && left.model === right.model
+    && (left.reasoningEffort ?? undefined) === (right.reasoningEffort ?? undefined)
+  if (before === undefined || typeof before.provider !== 'string' || typeof before.model !== 'string') return false
+  if (applied === undefined || same(before, applied)) return false
+  let now
+  try {
+    now = typeof readDefault === 'function' ? readDefault() : undefined
+  }
+  catch {
+    now = undefined
+  }
+  if (!same(now, applied)) return false
+  try {
+    await controller.selectModel({
+      provider: before.provider,
+      model: before.model,
+      ...(before.reasoningEffort === undefined ? {} : { reasoningEffort: before.reasoningEffort }),
+      sessionId,
+    })
+    return true
+  }
+  catch (error) {
+    if (typeof onWarn === 'function') onWarn('amplify: default model restore failed', error)
+    return false
+  }
+}
+
+/**
  * Create a runner bound to one host context.
- * @param options - `{ getController, getSession, getWorkspacePath, files, warn }`, where
- *   `files` supplies `{ write(chunks), read(dir), cleanup(dir) }` over the workspace and
+ * @param options - `{ getController, getSession, getWorkspacePath, getDefaultSelection, files, warn }`,
+ *   where `files` supplies `{ write(chunks), read(dir), cleanup(dir) }` over the workspace and
  *   `getSession(id)` returns a live Session so the run can audit its own coverage.
  * @returns `{ start, status, cancel, isActive, dispose }` over a single run slot.
  */
 export function createAmplifyRunner(options) {
-  const { getController, getSession, getWorkspacePath, files, warn } = options
+  const { getController, getSession, getWorkspacePath, getDefaultSelection, files, warn } = options
   let job
 
   /** Whether a run currently holds the slot. */
@@ -603,80 +679,144 @@ export function createAmplifyRunner(options) {
     }
   }
 
-  /** Drive the run: one prompt, one wait, then prefer the chat answer over any file. */
+  /** Drive the run, then always put the deployment default back. */
   async function run(controller, current) {
+    let before
+    try {
+      before = typeof getDefaultSelection === 'function' ? getDefaultSelection() : undefined
+    }
+    catch {
+      before = undefined
+    }
+    let applied
+    try {
+      applied = await runSummary(controller, current)
+    }
+    finally {
+      const restored = await restoreDefaultSelection({
+        controller,
+        sessionId: current.sessionId,
+        before,
+        applied,
+        readDefault: getDefaultSelection,
+        warn,
+      })
+      if (restored) trace(current, 'default model restored')
+    }
+  }
+
+  /**
+   * Drive the run: one prompt, one wait, then prefer the chat answer over any file.
+   * @returns the model selection this run installed, or undefined when it installed none.
+   */
+  async function runSummary(controller, current) {
     trace(current, `start chunks=${current.chunks.length} removedTurns=${current.removedTurns}`)
     const created = await controller.create({ workspaceId: current.workspaceId })
     current.sessionId = created.sessionId
     trace(current, `created session=${created.sessionId}`)
     await controller.rename({ sessionId: current.sessionId, title: amplifyTitle(current.removedTurns, current.locale) })
-    const wanted = current.model !== null && typeof current.model === 'object' && typeof current.model.model === 'string'
+    const requested = current.model !== null && typeof current.model === 'object' && typeof current.model.model === 'string'
       ? current.model
       : DEFAULT_MODEL
+    // Never let the effort go missing: `selectModel` also saves the deployment default, so a
+    // selection without one would leave every new conversation following the provider default.
+    const wanted = {
+      provider: requested.provider,
+      model: requested.model,
+      reasoningEffort: typeof requested.reasoningEffort === 'string' && requested.reasoningEffort !== ''
+        ? requested.reasoningEffort
+        : DEFAULT_MODEL.reasoningEffort,
+    }
+    let applied
     try {
       await controller.selectModel({ ...wanted, sessionId: current.sessionId })
+      applied = wanted
       current.diagnostics.push({ step: 'selectModel', applied: `${wanted.provider}/${wanted.model}/${wanted.reasoningEffort}` })
     }
     catch (error) {
       current.diagnostics.push({ step: 'selectModel', error: String(error?.message ?? error) })
     }
-    if (current.cancelled) return
+    if (current.cancelled) return applied
     current.state = 'summarizing'
+    /** Send one prompt and wait for the session to settle; returns its last text. */
+    const askRound = async (text) => {
+      const afterSeq = await readCursor(controller, current.sessionId)
+      trace(current, `cursor afterSeq=${String(afterSeq)}`)
+      await controller.prompt({
+        requestId: requestIdOf(current.sessionId),
+        sessionId: current.sessionId,
+        mode: 'queue',
+        content: [{ type: 'text', text }],
+      }, new AbortController().signal)
+      trace(current, 'prompt accepted, waiting')
+      const result = await waitForAgent(controller, current, afterSeq)
+      trace(current, `wait finished outcome=${result === undefined ? 'none' : `${result.length} chars`}`)
+      return result
+    }
     const prompt = summaryPrompt(current.dirRelative, current.chunks.length, current.locale)
     trace(current, `prompt chars=${prompt.length} chunks=${current.chunks.length}`)
-    const afterSeq = await readCursor(controller, current.sessionId)
-    trace(current, `cursor afterSeq=${String(afterSeq)}`)
-    await controller.prompt({
-      requestId: requestIdOf(current.sessionId),
-      sessionId: current.sessionId,
-      mode: 'queue',
-      content: [{ type: 'text', text: prompt }],
-    }, new AbortController().signal)
-    trace(current, 'prompt accepted, waiting')
-    const outcome = await waitForAgent(controller, current, afterSeq)
-    trace(current, `wait finished outcome=${outcome === undefined ? 'none' : `${outcome.length} chars`}`)
+    let outcome = await askRound(prompt)
     if (outcome === undefined) {
       if (!current.cancelled) current.error = 'the summary session produced no result'
-      return
+      return applied
     }
-    const fromFile = files.read(current.dir)
-    if (typeof fromFile === 'string' && fromFile.trim() !== '') {
-      current.summary = fromFile.trim()
-      current.diagnostics.push({ step: 'summary', source: 'file' })
+    /** The note a finished round left behind, from its file or its last message. */
+    const summaryOfRound = (text) => {
+      const fromFile = files.read(current.dir)
+      if (typeof fromFile === 'string' && fromFile.trim() !== '') {
+        current.diagnostics.push({ step: 'summary', source: 'file' })
+        return fromFile.trim()
+      }
+      if (typeof text === 'string' && text.trim() !== '') {
+        // The agent answered in the chat instead of writing the file.
+        current.diagnostics.push({ step: 'summary', source: 'chat' })
+        return text.trim()
+      }
+      return undefined
     }
-    else if (typeof outcome === 'string' && outcome.trim() !== '') {
-      // The agent answered in the chat instead of writing the file.
-      current.summary = outcome.trim()
-      current.diagnostics.push({ step: 'summary', source: 'chat' })
+    let summary = summaryOfRound(outcome)
+    if (summary === undefined || !looksLikeSummary(summary)) {
+      trace(current, `summary rejected chars=${summary === undefined ? 'none' : summary.length}`)
+      if (current.cancelled) return applied
+      // One nudge, because this failure is "described the plan and stopped", not "cannot do it".
+      outcome = await askRound(summaryNudge(current.locale))
+      if (outcome === undefined) {
+        if (!current.cancelled) current.error = 'the summary session produced no result after a retry'
+        return applied
+      }
+      summary = summaryOfRound(outcome)
+      trace(current, `retry summary chars=${summary === undefined ? 'none' : summary.length}`)
     }
-    if (current.summary === undefined) {
+    current.summary = summary
+    if (current.summary === undefined || !looksLikeSummary(current.summary)) {
       current.state = 'failed'
-      current.error = 'the summary session wrote no SUMMARY.md and returned no text'
+      current.error = 'the summary session returned a status line instead of a memory note'
       cleanup(current)
-      return
+      return applied
     }
     // Measure what the session actually read before it called itself done. This has to
     // happen before cleanup: the events live on the session, not on the scratch files.
     const coverage = measureCoverage(current)
     // Archive the dropped turns beside the summary so the revived session can look up the
     // original wording later. Local file writes only: this adds no model tokens.
+    let archived
     if (typeof files.writeHistory === 'function') {
       try {
-        const archived = files.writeHistory(current.workspacePath, {
+        archived = files.writeHistory(current.workspacePath, {
           title: current.title ?? '',
           turns: current.dropped,
           locale: current.locale,
         })
         if (archived !== undefined && typeof archived.indexRelative === 'string') {
-          // Point at the directory, not the index: searching the directory is the reliable
-          // way to find one topic among dozens of pages; the index is only an overview.
+          // Facts only. Anything phrased as an instruction here ends up in the visible
+          // conversation history, where the user reads it as an injected system note; the
+          // instructions live in the hidden system-prompt section instead.
           const where = typeof archived.dirRelative === 'string' ? archived.dirRelative : archived.indexRelative
           current.summary = [
             current.summary,
             '',
             '---',
-            `完整原文存档：${where}/（已按片切分）`,
-            '要找具体内容时用 history_search 搜关键词，命中哪个 part-NN.md 再读那一片；索引.md 只用来看整体结构。',
+            `完整原文存档：${where}/（共 ${archived.pages} 片，索引见 索引.md）`,
           ].join('\n')
           current.diagnostics.push({ step: 'archive', pages: archived.pages })
           trace(current, `history archived pages=${archived.pages}`)
@@ -696,6 +836,7 @@ export function createAmplifyRunner(options) {
     }
     current.state = 'done'
     cleanup(current)
+    return applied
   }
 
   /**

@@ -21,10 +21,17 @@ const SUMMARY_SECTION_ORDER = 50
 /** Marker the archive pointer starts with; its presence means an archive exists. */
 const ARCHIVE_MARKER = '完整原文存档：'
 
+/** Markers of the coverage fact line written by `coverageNote`. */
+const COVERAGE_MARKERS = ['【覆盖范围】', '【Coverage】']
+
 /**
  * Framing text that tells the model this is background rather than a request.
  * The archive hint is only added when the summary actually carries a pointer: sessions
  * summarised before the archive feature existed have nothing to point at.
+ *
+ * This section is invisible to the user, so it is the place for instructions. The same
+ * facts live in the summary itself; never move imperative wording back into the visible
+ * conversation history.
  * @param summary - the summary text.
  * @param hasArchive - whether the summary ends with an archive pointer.
  * @returns the section text.
@@ -42,6 +49,14 @@ const frame = (summary, hasArchive) => [
       '上面只是提要，不含原话。涉及具体原话、具体说法、具体细节时，先用 history_search 工具',
       '在存档里查，查到了再答；不要凭提要或印象补全。',
       '存档是你和这个人过去的对话记录，是你的记忆，不是一份陌生的资料库：回忆它，别当成查别人的档案。',
+    ]
+    : []),
+  ...(COVERAGE_MARKERS.some(marker => summary.includes(marker))
+    ? [
+      '',
+      '注意：这份摘要只覆盖了一部分较早的内容，其余部分没有进摘要。',
+      '涉及那段时期的原话、细节或承诺时，先用 history_search 查存档；',
+      '不要把「摘要里没有」当成「没发生过」。',
     ]
     : []),
 ].join('\n')

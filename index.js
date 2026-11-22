@@ -10,7 +10,7 @@
  *  - `POST /dsh-session-slim/preview`  body: `application/octet-stream` (the zip)
  *      Reads `manifest.json`, `chat_session_index.json` and every
  *      `chat_sessions/<id>.json` (newest first, capped), and answers
- *      `{ ok, uploadId, conversations: [{ id, title, turns, estTokens, updatedAt, turnChars, turnCharsOffset }] }`.
+ *      `{ ok, uploadId, conversations: [{ id, title, turns, chars, updatedAt, turnChars, turnCharsOffset }] }`.
  *
  *  - `POST /dsh-session-slim/build`  body: JSON `{ uploadId, conversationId, keepTurns, locale, note }`
  *      Rebuilds a single-conversation export archive that keeps only the most
@@ -36,6 +36,9 @@ import { inflateRawSync } from 'node:zlib'
 import { chunkTurns, createAmplifyRunner } from './amplify.js'
 import { installSummaryPrompt } from './summary-prompt.js'
 import { installHistoryTool } from './history-tool.js'
+import { installForceRecall, readMode, revivedArchiveOf, writeMode } from './force-recall.js'
+import { installFirstTurnGuard } from './first-turn.js'
+import { installModelTrace } from './model-trace.js'
 
 /** The plugin's own identity, echoed by the patch row and the client bundle. */
 export const name = 'session-slim'
@@ -64,6 +67,8 @@ export const AMPLIFY_START_ROUTE = '/dsh-session-slim/amplify/start'
 export const AMPLIFY_STATUS_ROUTE = '/dsh-session-slim/amplify/status'
 export const AMPLIFY_CANCEL_ROUTE = '/dsh-session-slim/amplify/cancel'
 export const AMPLIFY_DECIDE_ROUTE = '/dsh-session-slim/amplify/decide'
+/** Proactive recall: read or set the switch for one session's workspace. */
+export const FORCE_ROUTE = '/dsh-session-slim/force-recall'
 
 /** Filename shape of a DeepSeek website export. */
 const SCAN_PATTERN = /^deepseek_data.*\.zip$/i
@@ -117,9 +122,14 @@ function entryNameToId(entryName) {
   return SAFE_CONVERSATION_ID.test(id) ? id : 'unknown'
 }
 
-/** Context facts the picker marks conversations with. */
-const CONTEXT_WINDOW_TOKENS = 1048576
-const HISTORY_BUDGET_TOKENS = 790000
+/**
+ * How much kept text is "very likely too long for the window".
+ *
+ * Deliberately a character count, not a token count: the plugin cannot tokenize, so anything
+ * shown to the user is exact characters plus a warning — never an invented token figure. The
+ * number is conservative for Chinese (≈1 token per character) and generous for Latin text.
+ */
+const HISTORY_BUDGET_CHARS = 700000
 /** A conversation longer than this many USER turns carries the "slim first" badge. */
 const RECOMMEND_TURNS = 500
 /** Most USER turns the wizard offers to keep. */
@@ -638,33 +648,12 @@ export function conversationTurns(chain) {
   return turns
 }
 
-/** Token estimate for mixed Chinese/Latin text: CJK ≈ 1.45 chars per token, ASCII ≈ 3.6. */
-function textTokens(text) {
-  if (typeof text !== 'string' || text === '') return 0
-  let cjk = 0
-  let other = 0
-  for (const character of text) {
-    if ((character.codePointAt(0) ?? 0) >= 0x2e80) cjk += 1
-    else other += 1
-  }
-  return cjk / 1.45 + other / 3.6
-}
-
-/** Token estimate for one turn pair. */
-function turnTokens(turns) {
-  let total = 0
-  for (const turn of turns) total += textTokens(turn.userText) + textTokens(turn.replyText)
-  return Math.max(1, Math.round(total))
-}
-
-/** Per-turn characters and token estimates, trimmed to the newest turns the browser renders. */
+/** Per-turn character counts, trimmed to the newest turns the browser renders. */
 function turnCharsOf(turns) {
   const chars = turns.map(turn => turn.chars)
-  const tokens = turns.map(turn => Math.max(1, Math.round(textTokens(turn.userText) + textTokens(turn.replyText))))
-  if (chars.length <= MAX_TURN_SAMPLES) return { turnChars: chars, turnTokens: tokens, turnCharsOffset: 0 }
+  if (chars.length <= MAX_TURN_SAMPLES) return { turnChars: chars, turnCharsOffset: 0 }
   return {
     turnChars: chars.slice(chars.length - MAX_TURN_SAMPLES),
-    turnTokens: tokens.slice(tokens.length - MAX_TURN_SAMPLES),
     turnCharsOffset: chars.length - MAX_TURN_SAMPLES,
   }
 }
@@ -763,10 +752,11 @@ export function summarizeArchive(buffer) {
       id: row.id,
       title: (row.title.trim() !== '' ? row.title : conversation.title).trim(),
       turns: turns.length,
-      estTokens: turnTokens(turns),
+      // Characters only. A token count cannot be known without the model's tokenizer, and an
+      // invented number on a screen where the user decides how much to keep is worse than none.
+      chars: turns.reduce((sum, turn) => sum + turn.chars, 0),
       updatedAt: new Date(row.updatedAt).toISOString(),
       turnChars: turnChars.turnChars,
-      turnTokens: turnChars.turnTokens,
       turnCharsOffset: turnChars.turnCharsOffset,
     })
   }
@@ -866,7 +856,7 @@ export function buildSlimArchive(buffer, entryName, keepTurns, locale, note, amp
     keptTurns: kept.length,
     removedTurns: removed,
     totalTurns: turns.length,
-    estTokens: turnTokens(kept),
+    keptChars: kept.reduce((sum, turn) => sum + turn.chars, 0),
     fileName: `deepseek_data-slim-${conversation.id}.zip`,
   }
 }
@@ -929,8 +919,7 @@ export function previewHandler(ctx) {
       total: summary.total,
       omitted: Math.max(0, summary.total - summary.conversations.length),
       limits: {
-        contextWindowTokens: CONTEXT_WINDOW_TOKENS,
-        historyBudgetTokens: HISTORY_BUDGET_TOKENS,
+        historyBudgetChars: HISTORY_BUDGET_CHARS,
         recommendTurns: RECOMMEND_TURNS,
         maxKeepTurns: MAX_KEEP_TURNS,
       },
@@ -1047,7 +1036,7 @@ export function buildHandler(ctx, runner) {
         'x-dsh-slim-filename': encodeURIComponent(result.fileName),
         'x-dsh-slim-kept-turns': String(result.keptTurns),
         'x-dsh-slim-removed-turns': String(result.removedTurns),
-        'x-dsh-slim-est-tokens': String(result.estTokens),
+        'x-dsh-slim-kept-chars': String(result.keptChars),
       })
       response.end(result.zip)
     }
@@ -1237,8 +1226,7 @@ export function openHandler(ctx) {
       total: summary.total,
       omitted: Math.max(0, summary.total - summary.conversations.length),
       limits: {
-        contextWindowTokens: CONTEXT_WINDOW_TOKENS,
-        historyBudgetTokens: HISTORY_BUDGET_TOKENS,
+        historyBudgetChars: HISTORY_BUDGET_CHARS,
         recommendTurns: RECOMMEND_TURNS,
         maxKeepTurns: MAX_KEEP_TURNS,
       },
@@ -1523,10 +1511,10 @@ export function amplifyCancelHandler(runner) {
   }
 }
 
-/** Directory (inside the workspace) that keeps the archived original turns. */
-const HISTORY_DIR = '.dsh-revive'
 /** Index file name inside `HISTORY_DIR`. */
 const HISTORY_INDEX = '索引.md'
+/** Directory (inside the workspace) that keeps the archived original turns. */
+const HISTORY_DIR = '.dsh-revive'
 /** Largest character count one archive page may carry. */
 const HISTORY_PAGE_CHARS = 8000
 
@@ -1754,11 +1742,66 @@ export const amplifyFiles = {
 }
 
 /**
+ * Route handler: read or set forced-recall mode.
+ *
+ * Only a revived conversation may switch it on: anywhere else the paragraph would tell the
+ * model to use a tool that does not exist for that session.
+ * @param deps - `{ getSession, getWorkspacePath, headers }`.
+ * @returns the Node request handler.
+ */
+export function forceRecallHandler(deps) {
+  const { getSession, getWorkspacePath, headers } = deps
+  return async (request, response) => {
+    if (request.method !== 'POST') {
+      response.writeHead(405, { allow: 'POST' })
+      response.end()
+      return
+    }
+    if (!sameOrigin(request)) {
+      sendJson(response, 403, { ok: false, code: 'origin' })
+      return
+    }
+    const params = await readJsonBody(request, response)
+    if (params === undefined) return
+    const sessionId = isRecord(params) ? params.sessionId : undefined
+    const mode = isRecord(params) ? params.mode : undefined
+    if (typeof sessionId !== 'string' || sessionId === '') {
+      sendJson(response, 400, { ok: false, code: 'bad-request', error: 'sessionId must be a non-empty string' })
+      return
+    }
+    const session = typeof getSession === 'function' ? getSession(sessionId) : undefined
+    if (session === undefined || session === null) {
+      sendJson(response, 404, { ok: false, code: 'no-session' })
+      return
+    }
+    const workspacePath = typeof getWorkspacePath === 'function' ? getWorkspacePath(session) : undefined
+    if (typeof workspacePath !== 'string' || workspacePath === '') {
+      sendJson(response, 400, { ok: false, code: 'no-workspace' })
+      return
+    }
+    const revived = revivedArchiveOf(session, headers) !== undefined
+    let state = readMode(workspacePath, sessionId)
+    if (typeof mode === 'string') {
+      if (!revived) {
+        sendJson(response, 409, { ok: false, code: 'not-revived', revived: false, mode: state })
+        return
+      }
+      const written = writeMode(workspacePath, sessionId, mode)
+      if (written === undefined) {
+        sendJson(response, 400, { ok: false, code: 'bad-mode', mode: state })
+        return
+      }
+      state = written
+    }
+    sendJson(response, 200, { ok: true, revived, mode: state })
+  }
+}
+
+/**
  * Register the routes on the harness web server, which may be acquired later.
  * @param ctx - Host context.
  */
-export function apply(ctx) {
-  // Amplified sessions get their summary as a scoped system-prompt section, so the model
+export function apply(ctx) {  // Amplified sessions get their summary as a scoped system-prompt section, so the model
   // reads it as background instead of as a fresh user message. See summary-prompt.js.
   const headers = [NOTICES.zh.summaryHeader, NOTICES.en.summaryHeader]
   installSummaryPrompt(ctx, {
@@ -1774,20 +1817,41 @@ export function apply(ctx) {
   // The summary session is read back after the run so the plugin can tell whether it really
   // read every chunk. Captured once here because `ctx.get()` is not available later.
   let sessionsService
-  ctx.inject(['sessions'], (sub) => {
+  let workingDirectoryService
+  ctx.inject(['sessions', 'workingDirectory'], (sub) => {
     sessionsService = sub.get('sessions')
+    workingDirectoryService = sub.get('workingDirectory')
   })
+  // Captured the same way: the deployment's default model choice, read-only, used to restore
+  // what the amplify run had to change (see the runner) and to pick a thinking level for an
+  // imported session's first turn (see first-turn.js).
+  let defaultModelService
+  ctx.inject(['agentDefaultModel'], (sub) => {
+    defaultModelService = sub.get('agentDefaultModel')
+  })
+  /** The deployment default selection, or undefined when the service is unavailable. */
+  const defaultSelectionOf = () => {
+    try {
+      return typeof defaultModelService?.currentSelection === 'function' ? defaultModelService.currentSelection() : undefined
+    }
+    catch {
+      return undefined
+    }
+  }
+  /** Session by id, or undefined when it is not live. */
+  const sessionById = (id) => {
+    if (sessionsService === undefined || typeof sessionsService.get !== 'function') return undefined
+    try {
+      return sessionsService.get(id)
+    }
+    catch {
+      return undefined
+    }
+  }
   const runner = createAmplifyRunner({
     getController: () => ctx.get('sessionController'),
-    getSession: (id) => {
-      if (sessionsService === undefined || typeof sessionsService.get !== 'function') return undefined
-      try {
-        return sessionsService.get(id)
-      }
-      catch {
-        return undefined
-      }
-    },
+    getSession: sessionById,
+    getDefaultSelection: () => (typeof defaultModelService?.currentSelection === 'function' ? defaultModelService.currentSelection() : undefined),
     getWorkspacePath: (workspaceId) => {
       const registry = ctx.get('workspaceRegistry')
       if (registry === undefined || typeof registry.get !== 'function') return undefined
@@ -1796,6 +1860,44 @@ export function apply(ctx) {
       return typeof workspace.path === 'string' ? workspace.path : undefined
     },
     files: amplifyFiles,
+    warn: (message, error) => { warn(ctx, message, error) },
+  })
+  // Forced-recall mode, off by default: the switch lives in
+  // `<workspace>/.dsh-revive/force-recall.json`.
+  installForceRecall(ctx, {
+    getWorkspacePath: (session) => {
+      if (workingDirectoryService === undefined || typeof workingDirectoryService.get !== 'function') return undefined
+      try {
+        return workingDirectoryService.get(session)
+      }
+      catch {
+        return undefined
+      }
+    },
+    headers,
+    warn: (message, error) => { warn(ctx, message, error) },
+  })
+  // Recorder only: writes the thinking level a revived session is about to request, so a
+  // fallback to the provider default can be seen without guessing. See model-trace.js.
+  const workspacePathOf = (session) => {
+    if (workingDirectoryService === undefined || typeof workingDirectoryService.get !== 'function') return undefined
+    try {
+      return workingDirectoryService.get(session)
+    }
+    catch {
+      return undefined
+    }
+  }
+  installModelTrace(ctx, {
+    getWorkspacePath: workspacePathOf,
+    headers,
+    warn: (message, error) => { warn(ctx, message, error) },
+  })
+  // Imported sessions arrive without a model selection; give the first turn a thinking level
+  // instead of letting the provider pick its own. See first-turn.js.
+  installFirstTurnGuard(ctx, {
+    headers,
+    getDefaultSelection: defaultSelectionOf,
     warn: (message, error) => { warn(ctx, message, error) },
   })
   ctx.inject(['webServer'], (host) => {
@@ -1810,6 +1912,23 @@ export function apply(ctx) {
         host.webServer.register({ kind: 'exact', path: AMPLIFY_STATUS_ROUTE, handler: amplifyStatusHandler(runner) }),
         host.webServer.register({ kind: 'exact', path: AMPLIFY_CANCEL_ROUTE, handler: amplifyCancelHandler(runner) }),
         host.webServer.register({ kind: 'exact', path: AMPLIFY_DECIDE_ROUTE, handler: amplifyDecideHandler(runner) }),
+        host.webServer.register({
+          kind: 'exact',
+          path: FORCE_ROUTE,
+          handler: forceRecallHandler({
+            getSession: sessionById,
+            getWorkspacePath: (session) => {
+              if (workingDirectoryService === undefined || typeof workingDirectoryService.get !== 'function') return undefined
+              try {
+                return workingDirectoryService.get(session)
+              }
+              catch {
+                return undefined
+              }
+            },
+            headers,
+          }),
+        }),
       ]
       return () => {
         runner.dispose()
