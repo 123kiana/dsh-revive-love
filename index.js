@@ -38,7 +38,6 @@ import { installSummaryPrompt } from './summary-prompt.js'
 import { installHistoryTool } from './history-tool.js'
 import { installForceRecall, readMode, revivedArchiveOf, writeMode } from './force-recall.js'
 import { installFirstTurnGuard } from './first-turn.js'
-import { installModelTrace } from './model-trace.js'
 
 /** The plugin's own identity, echoed by the patch row and the client bundle. */
 export const name = 'session-slim'
@@ -1878,21 +1877,9 @@ export function apply(ctx) {  // Amplified sessions get their summary as a scope
     warn: (message, error) => { warn(ctx, message, error) },
   })
   // Recorder only: writes the thinking level a revived session is about to request, so a
-  // fallback to the provider default can be seen without guessing. See model-trace.js.
-  const workspacePathOf = (session) => {
-    if (workingDirectoryService === undefined || typeof workingDirectoryService.get !== 'function') return undefined
-    try {
-      return workingDirectoryService.get(session)
-    }
-    catch {
-      return undefined
-    }
-  }
-  installModelTrace(ctx, {
-    getWorkspacePath: workspacePathOf,
-    headers,
-    warn: (message, error) => { warn(ctx, message, error) },
-  })
+  // fallback to the provider default can be seen without guessing. Removed in 1.5.1: the
+  // first-turn guard below fixes that fallback, and `request/header` already records the
+  // selection per turn, so the extra file was pure noise in every workspace.
   // Imported sessions arrive without a model selection; give the first turn a thinking level
   // instead of letting the provider pick its own. See first-turn.js.
   installFirstTurnGuard(ctx, {

@@ -92,6 +92,8 @@ git clone https://github.com/123kiana/dsh-revive-love.git
 开关**按对话单独生效**（不是按工作区）：存在 `<工作区>/.dsh-revive/force-recall.json` 的
 `sessions.<会话 id>` 里，同一个工作区里的其它对话——包括你正在和 agent 聊天的那条——都不受影响。
 旧的按工作区的写法（`{ mode }` / `{ enabled }`）不再生效，升级后每个对话都是关的，需要单独打开。
+**关掉就是回到原样**：温度、上下文注入、系统提示词全部复原，之前注入的每轮提醒也不再发给模型
+（历史里仍留着，但请求里会被剔除）。
 
 **工具 `history_search`**：被移除轮次的逐字原文存档在工作区，摘要末尾留一个指针指向它。
 模型想核对「更早的时候到底怎么说的」，可以自己调 `history_search`：回复里带命中总数、分布、
@@ -170,15 +172,13 @@ git clone https://github.com/123kiana/dsh-revive-love.git
 | 增幅诊断日志 | `<工作区>/.dsh-slim/last-run.log` | **不自动删除**，超过 256 KiB 时重置 | 手动删该文件 |
 | 原对话存档 | `<工作区>/.dsh-revive/history-*/`（分片 + 索引） | **不自动删除** | 手动删该目录 |
 | 回忆开关 | `<工作区>/.dsh-revive/force-recall.json` | **不自动删除** | 删该文件即回到「关」 |
-| 回忆模式诊断日志 | `<工作区>/.dsh-revive/model-trace.log` | **不自动删除**，超过 64 KiB 时重置 | 手动删该文件 |
 | 总结会话 | 由 DSH 正常保存 | 不自动删除 | 像普通会话一样删 |
 
 > `.dsh-revive/` 里是**逐字的原对话**，隐私浓度比摘要高。如果工作区是 git 仓库，建议把它
 > 加进 `.gitignore`。
 
-两类日志都**不记录聊天正文**：增幅日志只记时间、阶段、计数与会话 id；`model-trace.log` 只记
-会话 id 和这条会话请求的模型 / 思考档位（用来确认档位有没有掉进 provider 默认），既不含聊天正文，
-也不含检索用的关键词。
+增幅日志**不记录聊天正文**：只记时间、阶段、计数与会话 id。回忆开关不留任何日志（1.5.1 起；
+早期版本写过 `.dsh-revive/model-trace.log`，可以手动删掉）。
 
 详见 [SECURITY.md](SECURITY.md)。
 

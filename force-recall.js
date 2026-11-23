@@ -289,20 +289,26 @@ export function installForceRecall(ctx, options) {
       if (typeof request?.purpose === 'string' && request.purpose !== '') return next(request)
       if (request?.system !== undefined) return next(request)
       const workspacePath = typeof request?.sessionId === 'string' ? revivedSessions.get(request.sessionId) : undefined
-      if (workspacePath === undefined || readMode(workspacePath, request.sessionId) === 'off') return next(request)
+      if (workspacePath === undefined) return next(request)
+      const mode = readMode(workspacePath, request.sessionId)
       const latestHint = Array.isArray(request.messages)
         ? request.messages.findLast(message => message?.source?.kind === HINT_SOURCE_KIND)
         : undefined
-      const messages = Array.isArray(request.messages)
+      // Reminders are plugin noise in the transcript, not conversation: while the switch is on
+      // only the newest one is sent, and once it is off every one of them is dropped so the
+      // model sees exactly what it would have seen without the switch ever being enabled.
+      const filtered = Array.isArray(request.messages)
         ? request.messages.filter((message) => {
           const kind = message?.source?.kind
-          if (SUPPRESSED_CONTEXT_KINDS.includes(kind)) return false
-          // Old reminders are stale instructions: keep only the newest one in the request.
-          if (kind === HINT_SOURCE_KIND) return message === latestHint
-          return true
+          if (kind === HINT_SOURCE_KIND) return mode === 'fact' && message === latestHint
+          if (mode === 'off') return true
+          return !SUPPRESSED_CONTEXT_KINDS.includes(kind)
         })
         : request.messages
-      return next({ ...request, messages, temperature: APP_TEMPERATURE })
+      if (mode === 'off') {
+        return next(filtered === request.messages ? request : { ...request, messages: filtered })
+      }
+      return next({ ...request, messages: filtered, temperature: APP_TEMPERATURE })
     }
     catch (error) {
       warn('app mode: request hook failed', error)

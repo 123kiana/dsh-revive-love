@@ -60,7 +60,7 @@ window.__ModuleLoader__.load({
     const ZH = {
       'action.label': '复活吧我的爱人',
       'recall.title': '回忆模式',
-      'recall.body': '打开后：每一轮都会强制提醒你先调 history_search 查旧原文（整句只是语气词、没有实际内容时除外），同时调高采样温度、屏蔽不必要的上下文注入。开着时每条消息都会多一次工具往返的 token 开销；插件自己不搜、不判断，也不额外调用模型。',
+      'recall.body': '打开后：每一轮都会强制提醒你先调 history_search 查旧原文（整句只是语气词、没有实际内容时除外），同时调高采样温度、屏蔽不必要的上下文注入。开着时每条消息都会多一次工具往返的 token 开销；插件自己不搜、不判断，也不额外调用模型。关掉即回原样，之前注入的提醒也不再发给模型。',
       'recall.mode.off': '关',
       'recall.mode.fact': '增强记忆与语气',
       'recall.hint.off': '回忆模式：关',
@@ -167,7 +167,7 @@ window.__ModuleLoader__.load({
     const EN = {
       'action.label': 'Revive my love',
       'recall.title': 'Recall mode',
-      'recall.body': 'When on: every turn is required to look up the original wording with history_search first (unless the message is nothing but filler), the sampling temperature is raised, and unnecessary context injections are hidden. Each message costs one extra tool round-trip in tokens. The plugin itself does not search, judge, or call any model.',
+      'recall.body': 'When on: every turn is required to look up the original wording with history_search first (unless the message is nothing but filler), the sampling temperature is raised, and unnecessary context injections are hidden. Each message costs one extra tool round-trip in tokens. The plugin itself does not search, judge, or call any model. Turn it off and everything is back to normal, including the reminders already in the transcript.',
       'recall.mode.off': 'Off',
       'recall.mode.fact': 'Enhanced recall & tone',
       'recall.hint.off': 'Recall mode: off',

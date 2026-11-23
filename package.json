@@ -1,6 +1,6 @@
 {
   "name": "dsh-revive-love",
-  "version": "1.5.0",
+  "version": "1.5.1",
   "description": "Unofficial third-party DSH plugin: revive an over-long DeepSeek chat export by importing only its most recent turns.",
   "keywords": [
     "context",
@@ -38,7 +38,6 @@
     "history-tool.js",
     "force-recall.js",
     "first-turn.js",
-    "model-trace.js",
     "index.js",
     "client.js",
     "cordis.patch.yml",
@@ -54,7 +53,7 @@
     "node": ">=18"
   },
   "scripts": {
-    "check": "node --check index.js && node --check client.js && node --check amplify.js && node --check summary-prompt.js && node --check history-tool.js && node --check force-recall.js && node --check first-turn.js && node --check model-trace.js"
+    "check": "node --check index.js && node --check client.js && node --check amplify.js && node --check summary-prompt.js && node --check history-tool.js && node --check force-recall.js && node --check first-turn.js"
   },
   "dsh": {
     "bundle": {
