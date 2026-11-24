@@ -36,7 +36,8 @@ import { inflateRawSync } from 'node:zlib'
 import { chunkTurns, createAmplifyRunner } from './amplify.js'
 import { installSummaryPrompt } from './summary-prompt.js'
 import { installHistoryTool } from './history-tool.js'
-import { installForceRecall, readMode, revivedArchiveOf, writeMode } from './force-recall.js'
+import { installForceRecall, readCompactionArchive, readMode, revivedArchiveOf, writeCompactionArchive, writeMode } from './force-recall.js'
+import { installCompactionArchive } from './compaction-archive.js'
 import { installFirstTurnGuard } from './first-turn.js'
 
 /** The plugin's own identity, echoed by the patch row and the client bundle. */
@@ -1764,6 +1765,7 @@ export function forceRecallHandler(deps) {
     if (params === undefined) return
     const sessionId = isRecord(params) ? params.sessionId : undefined
     const mode = isRecord(params) ? params.mode : undefined
+    const archive = isRecord(params) ? params.archive : undefined
     if (typeof sessionId !== 'string' || sessionId === '') {
       sendJson(response, 400, { ok: false, code: 'bad-request', error: 'sessionId must be a non-empty string' })
       return
@@ -1780,19 +1782,28 @@ export function forceRecallHandler(deps) {
     }
     const revived = revivedArchiveOf(session, headers) !== undefined
     let state = readMode(workspacePath, sessionId)
+    let archiving = readCompactionArchive(workspacePath, sessionId)
+    if (!revived && (typeof mode === 'string' || typeof archive === 'boolean')) {
+      sendJson(response, 409, { ok: false, code: 'not-revived', revived: false, mode: state, archive: archiving })
+      return
+    }
     if (typeof mode === 'string') {
-      if (!revived) {
-        sendJson(response, 409, { ok: false, code: 'not-revived', revived: false, mode: state })
-        return
-      }
       const written = writeMode(workspacePath, sessionId, mode)
       if (written === undefined) {
-        sendJson(response, 400, { ok: false, code: 'bad-mode', mode: state })
+        sendJson(response, 400, { ok: false, code: 'bad-mode', mode: state, archive: archiving })
         return
       }
       state = written
     }
-    sendJson(response, 200, { ok: true, revived, mode: state })
+    if (typeof archive === 'boolean') {
+      const written = writeCompactionArchive(workspacePath, sessionId, archive)
+      if (written === undefined) {
+        sendJson(response, 400, { ok: false, code: 'bad-archive', mode: state, archive: archiving })
+        return
+      }
+      archiving = written
+    }
+    sendJson(response, 200, { ok: true, revived, mode: state, archive: archiving })
   }
 }
 
@@ -1880,6 +1891,21 @@ export function apply(ctx) {  // Amplified sessions get their summary as a scope
   // fallback to the provider default can be seen without guessing. Removed in 1.5.1: the
   // first-turn guard below fixes that fallback, and `request/header` already records the
   // selection per turn, so the extra file was pure noise in every workspace.
+  // Compaction drops turns from the model's window; when the switch is on for an amplified
+  // conversation, append them to its archive so `history_search` can still find them.
+  installCompactionArchive(ctx, {
+    getWorkspacePath: (session) => {
+      if (workingDirectoryService === undefined || typeof workingDirectoryService.get !== 'function') return undefined
+      try {
+        return workingDirectoryService.get(session)
+      }
+      catch {
+        return undefined
+      }
+    },
+    headers,
+    warn: (message, error) => { warn(ctx, message, error) },
+  })
   // Imported sessions arrive without a model selection; give the first turn a thinking level
   // instead of letting the provider pick its own. See first-turn.js.
   installFirstTurnGuard(ctx, {

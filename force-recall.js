@@ -32,7 +32,7 @@ const HISTORY_DIR = '.dsh-revive'
 export const MODE_FILE = 'force-recall.json'
 
 /** The supported modes. `voice` is the retired third mode; it reads as on. */
-export const MODES = Object.freeze(['off', 'fact'])
+export const MODES = Object.freeze(['off', 'tone', 'fact'])
 
 /** Section name used when the paragraph is spliced into the assembled prompt. */
 export const FACT_SECTION_NAME = 'revive-love:recall-fact'
@@ -93,6 +93,20 @@ const PAST_HINT = [
   '查到什么就按原文说；查不到就换一个当时更可能用的说法再查一次，然后正常回答。',
   '唯一例外：这句话整句都只是语气词、没有实际内容，可以跳过（这一判断由你自己做，不看具体是哪几个字）。',
   '（不要说明你在查，也不要说「我查一下」。）',
+].join('\n')
+
+/**
+ * The encouragement injected on every turn in `tone` mode.
+ *
+ * `tone` keeps everything `fact` does — the same trimmed prompt, the same paragraph, the same
+ * suppressed context messages and temperature — but it does not demand a lookup. Measured on a
+ * real conversation, a soft/conditional reminder was ignored for nine consecutive turns, so
+ * this mode searches rarely; that is the point: the user pays for the voice, not for a tool
+ * round trip on every message.
+ */
+const TONE_HINT = [
+  '（这一轮如果是在讲以前的事，先用 history_search 查一下具体的人名、称呼、物件、地点或场景，看整轮原文再开口——摘要不是原话。）',
+  '查到什么就按原文说；查不到就正常回答。不是以前的事就不用查。',
 ].join('\n')
 
 /** Section name carried by the injected reminder message. */
@@ -163,17 +177,18 @@ function stepUserText(messages) {
 
 /**
  * Build the one-step reminder message.
+ * @param text - the reminder wording for the conversation's mode.
  * @returns a user-role message carrying the reminder.
  */
-function hintMessage() {
+function hintMessage(text) {
   return {
     id: randomUUID(),
     role: 'user',
-    content: [{ type: 'text', text: PAST_HINT }],
+    content: [{ type: 'text', text }],
     source: {
       kind: HINT_SOURCE_KIND,
       form: 'snapshot',
-      sections: [{ name: HINT_SECTION_NAME, text: PAST_HINT }],
+      sections: [{ name: HINT_SECTION_NAME, text }],
     },
   }
 }
@@ -198,7 +213,7 @@ export function readMode(workspacePath, sessionId) {
 
 /**
  * Write the switch for one conversation. Other conversations in the same workspace keep
- * their own value.
+ * their own value. Unknown keys in the file (such as the optional toolset map) are preserved.
  * @param workspacePath - absolute workspace path.
  * @param sessionId - the conversation's session id.
  * @param mode - one of {@link MODES}.
@@ -213,8 +228,78 @@ export function writeMode(workspacePath, sessionId, mode) {
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
     const store = readStore(workspacePath) ?? { sessions: {} }
     store.sessions[sessionId] = mode
-    writeFileSync(join(dir, MODE_FILE), `${JSON.stringify({ sessions: store.sessions, updatedAt: new Date().toISOString() }, null, 2)}\n`, 'utf8')
+    const next = { ...store, sessions: store.sessions, updatedAt: new Date().toISOString() }
+    writeFileSync(join(dir, MODE_FILE), `${JSON.stringify(next, null, 2)}\n`, 'utf8')
     return mode
+  }
+  catch {
+    return undefined
+  }
+}
+
+/**
+ * Tools kept when a conversation opts into the trimmed toolset.
+ *
+ * `history_search` is the point of the plugin; `read` stays because the search result tells the
+ * model to read nearby turns from the archive path it returns. Everything else (shell, file
+ * edits, subagents, schedules, the plugin manager, web access) is agent scaffolding that a
+ * revived conversation never needs, and removing it also removes the "I am a tool-using agent"
+ * framing from the request.
+ */
+export const TRIMMED_TOOLS = Object.freeze(['history_search', 'read'])
+
+/**
+ * Whether a conversation asked for the trimmed toolset.
+ *
+ * This is **per conversation** and purely request-side: it changes the tools sent to the model
+ * for that conversation, never the session, and deleting the entry restores the full list on the
+ * next message. `'full'` (or anything else, including a missing entry) means "send everything".
+ * @param workspacePath - absolute workspace path.
+ * @param sessionId - the conversation's session id.
+ * @returns `'trim'` or `'full'`.
+ */
+export function readToolset(workspacePath, sessionId) {
+  if (typeof workspacePath !== 'string' || workspacePath === '') return 'full'
+  if (typeof sessionId !== 'string' || sessionId === '') return 'full'
+  return readStore(workspacePath)?.tools?.[sessionId] === 'trim' ? 'trim' : 'full'
+}
+
+/**
+ * Whether a conversation archives what compaction drops into its existing history archive.
+ *
+ * This is a **separate switch** from the recall mode: it only decides whether a compaction
+ * appends the turns it removes to the archive, so `history_search` can still find them later.
+ * @param workspacePath - absolute workspace path.
+ * @param sessionId - the conversation's session id.
+ * @returns `true` when enabled for that conversation.
+ */
+export function readCompactionArchive(workspacePath, sessionId) {
+  if (typeof workspacePath !== 'string' || workspacePath === '') return false
+  if (typeof sessionId !== 'string' || sessionId === '') return false
+  return readStore(workspacePath)?.archive?.[sessionId] === true
+}
+
+/**
+ * Turn the compaction-archive switch on or off for one conversation.
+ * @param workspacePath - absolute workspace path.
+ * @param sessionId - the conversation's session id.
+ * @param enabled - the new value.
+ * @returns the value written, or undefined on failure.
+ */
+export function writeCompactionArchive(workspacePath, sessionId, enabled) {
+  if (typeof workspacePath !== 'string' || workspacePath === '') return undefined
+  if (typeof sessionId !== 'string' || sessionId === '') return undefined
+  if (typeof enabled !== 'boolean') return undefined
+  try {
+    const dir = join(workspacePath, HISTORY_DIR)
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
+    const store = readStore(workspacePath) ?? { sessions: {} }
+    const archive = { ...(store.archive ?? {}) }
+    if (enabled) archive[sessionId] = true
+    else delete archive[sessionId]
+    const next = { ...store, archive, updatedAt: new Date().toISOString() }
+    writeFileSync(join(dir, MODE_FILE), `${JSON.stringify(next, null, 2)}\n`, 'utf8')
+    return enabled
   }
   catch {
     return undefined
@@ -224,14 +309,19 @@ export function writeMode(workspacePath, sessionId, mode) {
 /**
  * Read the per-conversation switch file, normalising its shape.
  * @param workspacePath - absolute workspace path.
- * @returns `{ sessions }`, or undefined when the file is absent or unreadable.
+ * @returns `{ sessions, tools, archive }`, or undefined when the file is absent or unreadable.
  */
 function readStore(workspacePath) {
   try {
     const parsed = JSON.parse(readFileSync(join(workspacePath, HISTORY_DIR, MODE_FILE), 'utf8'))
     const sessions = parsed?.sessions
-    if (sessions !== null && typeof sessions === 'object' && !Array.isArray(sessions)) return { sessions }
-    return { sessions: {} }
+    const tools = parsed?.tools
+    const archive = parsed?.archive
+    return {
+      sessions: sessions !== null && typeof sessions === 'object' && !Array.isArray(sessions) ? sessions : {},
+      tools: tools !== null && typeof tools === 'object' && !Array.isArray(tools) ? tools : {},
+      archive: archive !== null && typeof archive === 'object' && !Array.isArray(archive) ? archive : {},
+    }
   }
   catch {
     return undefined
@@ -291,6 +381,14 @@ export function installForceRecall(ctx, options) {
       const workspacePath = typeof request?.sessionId === 'string' ? revivedSessions.get(request.sessionId) : undefined
       if (workspacePath === undefined) return next(request)
       const mode = readMode(workspacePath, request.sessionId)
+      // Optional, per-conversation tool trim: request-side only, so deleting the entry restores
+      // the full tool list on the next message. It is gated on the switch like everything else,
+      // so switching to `off` restores the full toolset too — no hidden residual state.
+      const trimmed = mode !== 'off'
+        && readToolset(workspacePath, request.sessionId) === 'trim'
+        && Array.isArray(request.tools)
+        ? request.tools.filter(tool => TRIMMED_TOOLS.includes(tool?.name))
+        : request.tools
       const latestHint = Array.isArray(request.messages)
         ? request.messages.findLast(message => message?.source?.kind === HINT_SOURCE_KIND)
         : undefined
@@ -300,15 +398,16 @@ export function installForceRecall(ctx, options) {
       const filtered = Array.isArray(request.messages)
         ? request.messages.filter((message) => {
           const kind = message?.source?.kind
-          if (kind === HINT_SOURCE_KIND) return mode === 'fact' && message === latestHint
+          if (kind === HINT_SOURCE_KIND) return mode !== 'off' && message === latestHint
           if (mode === 'off') return true
           return !SUPPRESSED_CONTEXT_KINDS.includes(kind)
         })
         : request.messages
+      const changed = filtered !== request.messages || trimmed !== request.tools
       if (mode === 'off') {
-        return next(filtered === request.messages ? request : { ...request, messages: filtered })
+        return next(changed ? { ...request, messages: filtered, tools: trimmed } : request)
       }
-      return next({ ...request, messages: filtered, temperature: APP_TEMPERATURE })
+      return next({ ...request, messages: filtered, tools: trimmed, temperature: APP_TEMPERATURE })
     }
     catch (error) {
       warn('app mode: request hook failed', error)
@@ -329,11 +428,13 @@ export function installForceRecall(ctx, options) {
       const session = agent?.session
       if (session === undefined || session === null || typeof session.id !== 'string') return decision
       const workspacePath = revivedSessions.get(session.id)
-      if (workspacePath === undefined || readMode(workspacePath, session.id) === 'off') return decision
+      if (workspacePath === undefined) return decision
+      const mode = readMode(workspacePath, session.id)
+      if (mode === 'off') return decision
       const text = stepUserText(payload?.messages)
       if (text !== undefined && !hasRealContent(text)) return decision
       const messages = Array.isArray(decision?.messages) ? decision.messages : []
-      return { ...decision, messages: [...messages, hintMessage()] }
+      return { ...decision, messages: [...messages, hintMessage(mode === 'tone' ? TONE_HINT : PAST_HINT)] }
     }
     catch (error) {
       warn('app mode: pre-step hook failed', error)

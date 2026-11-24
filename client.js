@@ -60,13 +60,21 @@ window.__ModuleLoader__.load({
     const ZH = {
       'action.label': '复活吧我的爱人',
       'recall.title': '回忆模式',
-      'recall.body': '打开后：每一轮都会强制提醒你先调 history_search 查旧原文（整句只是语气词、没有实际内容时除外），同时调高采样温度、屏蔽不必要的上下文注入。开着时每条消息都会多一次工具往返的 token 开销；插件自己不搜、不判断，也不额外调用模型。关掉即回原样，之前注入的提醒也不再发给模型。',
+      'recall.body': '三档：关 / 增强语气 / 增强记忆与语气。后两档都会调高采样温度、屏蔽不必要的上下文注入、系统提示词只留本插件的段；区别是「增强记忆与语气」每一轮都会强制提醒你先调 history_search 查旧原文（整句只是语气词时除外），每条消息多一次工具往返的开销；「增强语气」只给一句鼓励，不强制查，省下工具往返。插件自己不搜、不判断，也不额外调用模型。关掉即回原样，之前注入的提醒也不再发给模型。',
       'recall.mode.off': '关',
+      'recall.mode.tone': '增强语气',
       'recall.mode.fact': '增强记忆与语气',
       'recall.hint.off': '回忆模式：关',
+      'recall.hint.tone': '增强语气已开启',
       'recall.hint.fact': '增强记忆与语气已开启',
       'recall.notRevived': '这个开关只对复活会话有用',
       'recall.failed': '切换失败，请稍后再试',
+      'recall.archive.title': '压缩上下文时归档',
+      'recall.archive.body': '每次压缩上下文，把被压缩掉的轮次按原话追加到存档，之后 history_search 还能搜到。只对增幅复活的会话生效，摘要本身不收录。',
+      'recall.archive.on': '开',
+      'recall.archive.off': '关',
+      'recall.archive.flashOn': '压缩时归档：开',
+      'recall.archive.flashOff': '压缩时归档：关',
       // Status of the last turn; recall is invisible, so the panel has to report it.
       'dialog.title': '复活吧我的爱人',
       'dialog.description': '把一个过长的对话裁短后再导入，避免超出模型上下文上限。',
@@ -167,13 +175,21 @@ window.__ModuleLoader__.load({
     const EN = {
       'action.label': 'Revive my love',
       'recall.title': 'Recall mode',
-      'recall.body': 'When on: every turn is required to look up the original wording with history_search first (unless the message is nothing but filler), the sampling temperature is raised, and unnecessary context injections are hidden. Each message costs one extra tool round-trip in tokens. The plugin itself does not search, judge, or call any model. Turn it off and everything is back to normal, including the reminders already in the transcript.',
+      'recall.body': 'Three levels: off / enhanced tone / enhanced recall & tone. The two "on" levels both raise the sampling temperature, hide unnecessary context injections and keep only this plugin\'s system-prompt sections. "Enhanced recall & tone" also requires every turn to look up the original wording with history_search first (filler-only messages excepted), which costs one extra tool round-trip per message; "enhanced tone" only leaves an encouragement and never forces a lookup. The plugin itself does not search, judge, or call any model. Turn it off and everything is back to normal, including the reminders already in the transcript.',
       'recall.mode.off': 'Off',
+      'recall.mode.tone': 'Enhanced tone',
       'recall.mode.fact': 'Enhanced recall & tone',
       'recall.hint.off': 'Recall mode: off',
+      'recall.hint.tone': 'Enhanced tone on',
       'recall.hint.fact': 'Enhanced recall & tone on',
       'recall.notRevived': 'This switch only applies to a revived conversation',
       'recall.failed': 'Could not switch it, try again',
+      'recall.archive.title': 'Archive on compaction',
+      'recall.archive.body': 'Every time the context is compacted, append the dropped turns verbatim to the archive so history_search still finds them. Amplified conversations only; the summary itself is not archived.',
+      'recall.archive.on': 'On',
+      'recall.archive.off': 'Off',
+      'recall.archive.flashOn': 'Archive on compaction: on',
+      'recall.archive.flashOff': 'Archive on compaction: off',
       'dialog.title': 'Revive my love',
       'dialog.description': 'Shorten one over-long conversation before importing it, so it fits the model context window.',
       'dialog.step': 'Step {step} of 3',
@@ -1558,7 +1574,11 @@ window.__ModuleLoader__.load({
           if (!response.ok) { setRecall(null); return }
           const payload = await response.json()
           setRecall(payload !== null && typeof payload === 'object'
-            ? { revived: payload.revived === true, mode: typeof payload.mode === 'string' ? payload.mode : 'off' }
+            ? {
+              revived: payload.revived === true,
+              mode: typeof payload.mode === 'string' ? payload.mode : 'off',
+              archive: payload.archive === true,
+            }
             : null)
         }
         catch {
@@ -1588,8 +1608,34 @@ window.__ModuleLoader__.load({
             return
           }
           const stored = typeof payload.mode === 'string' ? payload.mode : 'off'
-          setRecall({ revived: true, mode: stored })
+          setRecall({ revived: true, mode: stored, archive: payload.archive === true })
           flash(t(`recall.hint.${stored}`))
+        }
+        catch {
+          flash(t('recall.failed'))
+        }
+      }, [currentSessionId, flash, t])
+
+      /** Toggle "archive what compaction drops" for the conversation in view. */
+      const applyArchive = useCallback(async (enabled) => {
+        if (typeof currentSessionId !== 'string') return
+        try {
+          const response = await fetch(routeUrl(FORCE_ROUTE), {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ sessionId: currentSessionId, archive: enabled }),
+          })
+          const payload = await response.json().catch(() => null)
+          if (!response.ok || payload?.ok !== true) {
+            flash(t('recall.failed'))
+            return
+          }
+          setRecall({
+            revived: true,
+            mode: typeof payload.mode === 'string' ? payload.mode : 'off',
+            archive: payload.archive === true,
+          })
+          flash(t(payload.archive === true ? 'recall.archive.flashOn' : 'recall.archive.flashOff'))
         }
         catch {
           flash(t('recall.failed'))
@@ -1621,12 +1667,13 @@ window.__ModuleLoader__.load({
 
       const mode = recall === null ? 'off' : recall.mode
       const label = `${t('recall.title')}：${t(`recall.mode.${mode}`)}`
+      const triggerTone = mode === 'off' ? '' : mode === 'tone' ? ' dsh-slim-trigger-amber' : ' dsh-slim-trigger-red'
 
       return h(React.Fragment, null,
         props.children === undefined ? null : props.children,
         h('button', {
           type: 'button',
-          className: `dsh-slim-trigger${mode === 'off' ? '' : ' dsh-slim-trigger-red'}`,
+          className: `dsh-slim-trigger${triggerTone}`,
           'aria-label': `${t('action.label')} — ${label}`,
           title: `${t('action.label')}（长按 1 秒：${label}）`,
           onPointerDown: startPress,
@@ -1650,7 +1697,7 @@ window.__ModuleLoader__.load({
           h('h3', { className: 'dsh-slim-confirm-title' }, t('recall.title')),
           h('p', { className: 'dsh-slim-confirm-body' }, t('recall.body')),
           h('div', { className: 'dsh-slim-mode-list' },
-            ...['off', 'fact'].map(option => {
+            ...['off', 'tone', 'fact'].map(option => {
               const active = mode === option
               return h('button', {
                 key: option,
@@ -1660,6 +1707,18 @@ window.__ModuleLoader__.load({
                 onClick: () => { setPicker(false); void apply(option) },
               }, t(`recall.mode.${option}`))
             }),
+          ),
+          h('div', { className: 'dsh-slim-archive' },
+            h('div', { className: 'dsh-slim-archive-text' },
+              h('strong', null, t('recall.archive.title')),
+              h('p', null, t('recall.archive.body')),
+            ),
+            h('button', {
+              type: 'button',
+              className: `dsh-slim-button dsh-slim-mode${recall?.archive === true ? ' dsh-slim-primary' : ''}`,
+              'aria-pressed': recall?.archive === true,
+              onClick: () => { void applyArchive(!(recall?.archive === true)) },
+            }, t(recall?.archive === true ? 'recall.archive.on' : 'recall.archive.off')),
           ),
         ) : null,
         open ? h(Wizard, { props, t, onClose: () => { setOpen(false); void refresh() } }) : null,
@@ -1700,6 +1759,8 @@ window.__ModuleLoader__.load({
 /* Forced-recall on: the same trigger turns red. */
 .dsh-slim-trigger-red{color:#dc2626;opacity:1}
 .dsh-slim-trigger-red:hover{color:#dc2626;background:rgba(220,38,38,.12)}
+.dsh-slim-trigger-amber{color:#d97706;opacity:1}
+.dsh-slim-trigger-amber:hover{color:#d97706;background:rgba(217,119,6,.12)}
 .dsh-slim-toast{position:fixed;left:50%;bottom:28px;z-index:1100;transform:translateX(-50%);max-width:min(420px,80vw);padding:7px 14px;border:1px solid var(--dsw-alias-border-subtle,rgba(128,128,128,.32));border-radius:999px;background:var(--dsw-alias-bg-elevated,Canvas);color:var(--dsw-alias-text-primary,CanvasText);box-shadow:0 8px 24px rgba(0,0,0,.28);font:inherit;font-size:12px;line-height:1.4;text-align:center;pointer-events:none}
 .dsh-slim-confirm{position:fixed;left:50%;top:50%;z-index:1100;transform:translate(-50%,-50%);width:min(360px,86vw);padding:18px 18px 14px;border:1px solid var(--dsw-alias-border-subtle,rgba(128,128,128,.32));border-radius:12px;background:var(--dsw-alias-bg-elevated,Canvas);color:var(--dsw-alias-text-primary,CanvasText);box-shadow:0 16px 48px rgba(0,0,0,.38);font:inherit;font-size:13px;line-height:1.5}
 .dsh-slim-confirm-title{margin:0 0 8px;font-size:14px;font-weight:600}
@@ -1707,6 +1768,11 @@ window.__ModuleLoader__.load({
 .dsh-slim-confirm-actions{display:flex;justify-content:flex-end;gap:8px}
 .dsh-slim-mode-list{display:flex;flex-direction:column;gap:8px}
 .dsh-slim-mode{width:100%;justify-content:flex-start}
+.dsh-slim-archive{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:14px;padding-top:12px;border-top:1px solid var(--dsw-alias-border-subtle,rgba(128,128,128,.32))}
+.dsh-slim-archive-text{min-width:0;flex:1 1 auto}
+.dsh-slim-archive-text strong{display:block;font-size:13px;font-weight:600}
+.dsh-slim-archive-text p{margin:2px 0 0;color:var(--dsw-alias-text-secondary,GrayText);font-size:12px;line-height:1.45}
+.dsh-slim-archive>.dsh-slim-mode{width:auto;flex:0 0 auto;min-width:64px;justify-content:center}
 .dsh-slim-overlay{position:fixed;inset:0;z-index:1000;display:flex;align-items:center;justify-content:center;padding:24px;background:rgba(0,0,0,.42)}
 .dsh-slim-dialog{display:flex;flex-direction:column;width:min(620px,100%);max-height:min(86vh,760px);border:1px solid var(--dsw-alias-border-subtle,rgba(128,128,128,.32));border-radius:12px;background:var(--dsw-alias-bg-elevated,Canvas);color:var(--dsw-alias-text-primary,CanvasText);box-shadow:0 16px 48px rgba(0,0,0,.38);font:inherit;font-size:13px;line-height:1.5;overflow:hidden}
 .dsh-slim-dialog:focus{outline:none}
