@@ -129,7 +129,7 @@ git clone https://github.com/123kiana/dsh-revive-love.git
 | `MAX_ARCHIVE_BYTES` | `256 MiB` | 单次上传上限 |
 | `MAX_ENTRY_BYTES` | `256 MiB` | 单个压缩包条目解压后的上限 |
 
-### 实验：只给这条会话两个工具
+### 可选：只给这条会话两个工具（试验后保留）
 
 复活会话默认还是带着 DSH 的全套工具（shell、文件读写、subagent、workflow、schedule……共 30 多个）。
 这些工具会往请求里塞约 3 万字 schema，也会把模型往「工具型 agent」的语气上带。想试「只留
